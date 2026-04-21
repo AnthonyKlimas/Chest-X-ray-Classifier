@@ -1,5 +1,11 @@
 
 """
+
+    I attempted Mixup, but it has bad applicability to chest X-rays
+    that contain continous structures that Mixup disrups
+
+    
+
     Applies Mixup only to samples that belong to at least one minority class.
     Non-minority samples pass through unchanged.
 

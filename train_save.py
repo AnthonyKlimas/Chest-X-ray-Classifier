@@ -91,6 +91,11 @@ WEIGHT_DECAY = 1e-2
 # Sample extra from low appearing catagories
 SAMPLER_POWER = 0.17
 
+# Warmup backbone; previously trained
+WARMUP_EPOCHS = 3
+WARMUP_START_FACTOR = 0.3
+WARMUP_END_FACTOR = 1.0
+
 
 VIEW_POSITION_SCALE = 0.35
 
@@ -142,6 +147,9 @@ def print_train_parameters():
     print("SSL_CKPT", SSL_CKPT)
     print("MODEL_OUTPUT_FILE", MODEL_OUTPUT_FILE)
     print("SAMPLER_POWER", SAMPLER_POWER)
+    print("WARMUP_EPOCHS", WARMUP_EPOCHS)
+    print("WARMUP_START_FACTOR", WARMUP_START_FACTOR)
+    print("WARMUP_END_FACTOR", WARMUP_END_FACTOR)
     print("NUM_EPOCHS", NUM_EPOCHS)
     print("BASE_LR", BASE_LR)
     print("HEAD_LR_MULTIPLIER", HEAD_LR_MULTIPLIER)
@@ -201,22 +209,43 @@ def layer_unfreeze_epoch(layer_idx, schedule):
             return epoch
     return 1
 
-def make_lr_lambda(unfreeze_epoch, base_lr):
-    eta_ratio = 1e-6 / base_lr
-    cosine_span = NUM_EPOCHS - unfreeze_epoch - UNFREEZE_WARMUP_EPOCHS
+class UnfreezeScheduler:
+    def __init__(self, layer_to_idx, optimizer, schedule, warmup_epochs):
+        self.epoch = 1
+        self.optimizer = optimizer
+        self.schedule = schedule
+        self.layer_to_idx = layer_to_idx
+        self.warmup_epochs = warmup_epochs
+        # freeze layers
+        for layer, idx in layer_to_idx.items():
+            for p in layer.parameters():
+                p.requires_grad = False
 
-    def lr_lambda(epoch):
-        e = epoch + 1
-        if e < unfreeze_epoch:
-            return 0.0
-        warmup_frac = (e - unfreeze_epoch) / UNFREEZE_WARMUP_EPOCHS
-        if warmup_frac < 1.0:
-            return UNFREEZE_WARMUP_FACTOR + (1 - UNFREEZE_WARMUP_FACTOR) * warmup_frac
-        cosine_e = e - unfreeze_epoch - UNFREEZE_WARMUP_EPOCHS
-        cos = 0.5 * (1 + math.cos(math.pi * cosine_e / max(cosine_span, 1)))
-        return eta_ratio + (1 - eta_ratio) * cos
-
-    return lr_lambda
+    # Unfreeze layers per schedule
+    def step(self, group_warmup_remaining):
+        newly_unfrozen = set()
+        if self.epoch in self.schedule:
+            if group_warmup_remaining:
+                print(f"WARNING: Unfreezing at epoch {self.epoch} but warmup still active for layers: {list(group_warmup_remaining.keys())}")
+            
+            threshold = self.schedule[self.epoch]
+            # Check no warmup is still in progress
+            for layer, idx in self.layer_to_idx.items():
+                if idx >= threshold:
+                    for p in layer.parameters():
+                        if not p.requires_grad:
+                            p.requires_grad = True
+                            newly_unfrozen.add(idx)
+            for group in self.optimizer.param_groups:
+                lidx = group.get("layer_idx", -1)
+                if lidx in newly_unfrozen:
+                    # Use cosine-decayed peer LR, not the original base_lr
+                    ref = next(g for g in self.optimizer.param_groups
+                            if g.get("layer_idx") == -1)
+                    cosine_scale = ref["lr"] / ref["base_lr"]
+                    group["lr"] = group["base_lr"] * cosine_scale
+                    group_warmup_remaining[lidx] = self.warmup_epochs
+        self.epoch += 1
 
 def init_split(df, label_matrix):
     patient_ids = df["Patient ID"].unique()
@@ -379,39 +408,51 @@ class SwinWithView(torch.nn.Module):
 
 
 # Param Groups
-def init_param_groups(model, base_lr=1e-4, decay=0.8, schedule=None):
-    schedule = schedule or {}
+def init_param_groups(model, base_lr=1e-4, decay=0.8):
     groups = []
     seen = set()
 
     def add(params, lr, layer_idx, weight_decay=1e-2):
         wd, no_wd = [], []
+
         for p in params:
             pid = id(p)
-            if pid in seen: continue
+            if pid in seen:
+                continue
             seen.add(pid)
-            (wd if p.ndim > 1 else no_wd).append(p)
 
-        ue = layer_unfreeze_epoch(layer_idx, schedule)
-        for bucket, wdv in [(wd, weight_decay), (no_wd, 0.0)]:
-            if bucket:
-                groups.append({
-                    "params": bucket,
-                    "lr": lr,
-                    "base_lr": lr,           # stored for lambda scaling
-                    "layer_idx": layer_idx,
-                    "unfreeze_epoch": ue,
-                    "weight_decay": wdv,
-                })
+            if p.ndim <= 1:
+                no_wd.append(p)
+            else:
+                wd.append(p)
+
+        if wd:
+            groups.append({
+                "params": wd,
+                "lr": lr,
+                "layer_idx": layer_idx,
+                "weight_decay": weight_decay
+            })
+
+        if no_wd:
+            groups.append({
+                "params": no_wd,
+                "lr": lr,
+                "layer_idx": layer_idx,
+                "weight_decay": 0.0
+            })
 
     layers = list(model.backbone.layers)
-    for i, layer in enumerate(layers):
-        add(layer.parameters(), base_lr * (decay ** i), i)
 
-    add(model.head.parameters(),       base_lr * HEAD_LR_MULTIPLIER, -1)
+    for i, layer in enumerate(reversed(layers)):
+        lr = base_lr * (decay ** i)
+        layer_idx = len(layers) - 1 - i
+        add(layer.parameters(), lr, layer_idx)
+
+    add(model.head.parameters(), base_lr * HEAD_LR_MULTIPLIER, layer_idx=-1)
     add(model.view_embed.parameters(), base_lr, -1)
-    add(model.view_mlp.parameters(),   base_lr, -1)
-    add(model.attn_pool.parameters(),  base_lr, -1)
+    add(model.view_mlp.parameters(), base_lr, -1)
+    add(model.attn_pool.parameters(), base_lr, -1)
     add([model.attn_temp, model.view_scale], base_lr, -1)
 
     leftovers = [p for p in model.parameters() if id(p) not in seen]
@@ -419,6 +460,7 @@ def init_param_groups(model, base_lr=1e-4, decay=0.8, schedule=None):
         add(leftovers, base_lr * (decay ** len(layers)), -2)
 
     return groups
+
 
 # Main Model Driver
 if __name__ == "__main__":
@@ -533,21 +575,10 @@ if __name__ == "__main__":
     # Model Training Checkpoint
     init_ckpt(model=model, path=SSL_CKPT)
                 
-    param_group = init_param_groups(model, base_lr=BASE_LR,
-                                    decay=LR_LAYER_DECAY, schedule=UNFREEZE_SCHEDULE)
-    optimizer = torch.optim.AdamW(param_group, weight_decay=WEIGHT_DECAY)
+    param_group = init_param_groups(model, base_lr=BASE_LR, decay=LR_LAYER_DECAY)
 
+    optimizer = torch.optim.AdamW(param_group, weight_decay=WEIGHT_DECAY)    
 
-    lambdas = [make_lr_lambda(g["unfreeze_epoch"], g["base_lr"])
-            for g in optimizer.param_groups]
-    
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambdas)
-
-    # Freeze backbone layers whose unfreeze_epoch > 1
-    for layer, idx in layer_to_idx.items():
-        if layer_unfreeze_epoch(idx, UNFREEZE_SCHEDULE) > 1:
-            for p in layer.parameters():
-                p.requires_grad = False
    
     # scaler = GradScaler(device="cuda")
     criterion = AsymmetricLoss(
@@ -557,24 +588,40 @@ if __name__ == "__main__":
         label_smooth=0.05,
     )
 
+    # Slow head learning initally
+    # warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+    #     optimizer,
+    #     start_factor=WARMUP_START_FACTOR,
+    #     end_factor=WARMUP_END_FACTOR,
+    #     total_iters=WARMUP_EPOCHS
+    # )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=NUM_EPOCHS - WARMUP_EPOCHS,
+        eta_min=1e-6
+    )
 
-    ### Training cycle ###
+    # Unfreeze SwinV2 stages to warmup backbone
+    unfreeze_scheduler = UnfreezeScheduler(
+        layer_to_idx=layer_to_idx,
+        optimizer=optimizer,
+        schedule=UNFREEZE_SCHEDULE,
+        warmup_epochs=UNFREEZE_WARMUP_EPOCHS
+    )
+
+    # scheduler = torch.optim.lr_scheduler.SequentialLR(
+    #     optimizer,
+    #     schedulers=[warmup_scheduler, cosine_scheduler],
+    #     milestones=[WARMUP_EPOCHS]
+    # )
+
+
+    # Training Loop
     def run_epoch(loader, train=True):
-
-        for group in optimizer.param_groups:
-            for p in group["params"]:
-                if getattr(p, "_just_unfroze", False):
-                    state = optimizer.state.get(p)
-                    if state:
-                        state.pop("exp_avg", None)
-                        state.pop("exp_avg_sq", None)
-                    p._just_unfroze = False
-
         model.train() if train else model.eval()
         total_loss = 0.0
         n_samples = 0
         all_logits, all_labels = [], []
-
 
         with torch.set_grad_enabled(train):
             for imgs, lbls, views in tqdm(loader, desc="train" if train else "val ", leave=False, mininterval=10.0):
@@ -589,10 +636,14 @@ if __name__ == "__main__":
                     loss = criterion(logits, lbls)
 
                 if train:
-                    optimizer.zero_grad()
                     loss.backward()
+                    # scaler.scale(loss).backward()
+                    # scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    # scaler.step(optimizer)
+                    # scaler.update()
                     optimizer.step()
+                    optimizer.zero_grad()
 
                 total_loss += loss.item() * imgs.size(0)
                 all_logits.append(logits.sigmoid().float().cpu().detach())
@@ -621,24 +672,19 @@ if __name__ == "__main__":
 
 
 
-   
+    # After building optimizer, store intended LRs once
+    for group in optimizer.param_groups:
+        group["base_lr"] = group["lr"]
+
+    # Epoch Loop
     best_val = 0.0
     no_improve = 0
-    UNFROZEN_PARAMS = set()
+    group_warmup_remaining = {}
     
-    ### Training loop ###
+
     for epoch in range(1, NUM_EPOCHS + 1):
-        # Unfreeze layers at scheduled epoch
-        for layer, idx in layer_to_idx.items():
-            if epoch == layer_unfreeze_epoch(idx, UNFREEZE_SCHEDULE):
-                for p in layer.parameters():
-                    p.requires_grad = True
 
-
-                    if p not in UNFROZEN_PARAMS:
-                        optimizer.state.pop(p, None)
-                        UNFROZEN_PARAMS.add(p)
-
+        
 
         tr_loss, tr_auc, _ = run_epoch(train_loader, train=True)
         torch.cuda.empty_cache()
@@ -662,14 +708,29 @@ if __name__ == "__main__":
             f"train_loss={tr_loss:.4f}  train_auc={tr_auc:.4f}  "
             f"val_loss={val_loss:.4f}  val_auc={val_auc:.4f}")
 
-        head_lr  = next(g["lr"] for g in optimizer.param_groups if g.get("layer_idx") == -1)
-        layer3_lr = next(g["lr"] for g in optimizer.param_groups if g.get("layer_idx") == 3)
-        print(f"  head_lr={head_lr:.2e}  layer3_lr={layer3_lr:.2e}")
+        print(f"  head_lr={optimizer.param_groups[0]['lr']:.2e}  "
+            f"layer3_lr={next(g['lr'] for g in optimizer.param_groups if g.get('layer_idx')==3):.2e}")
+                
 
-        for g in optimizer.param_groups:
-            print(g["layer_idx"], g["lr"])
+        unfreeze_scheduler.step(group_warmup_remaining)
+        if epoch <= WARMUP_EPOCHS:
+            warmup_scheduler.step()
+        else:
+            cosine_scheduler.step()
 
-        scheduler.step()
+        # Mini-warmup overrides cosine for newly unfrozen groups
+        for group in optimizer.param_groups:
+            lidx = group.get("layer_idx", -1)
+            if lidx in group_warmup_remaining:
+                epochs_done = UNFREEZE_WARMUP_EPOCHS - group_warmup_remaining[lidx]
+                scale = UNFREEZE_WARMUP_FACTOR + (1 - UNFREEZE_WARMUP_FACTOR) * (epochs_done / UNFREEZE_WARMUP_EPOCHS)
+                group["lr"] = group["base_lr"] * scale
+
+        # Decrement warmup counters
+        for k in list(group_warmup_remaining):
+            group_warmup_remaining[k] -= 1
+            if group_warmup_remaining[k] <= 0:
+                del group_warmup_remaining[k]
 
         if no_improve >= PATIENCE:
             print(f"Early stopping triggered at epoch {epoch}")
