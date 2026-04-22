@@ -12,7 +12,7 @@ In this project, we attempt to tune a preprocessing pipeline, a SimMIM SwinV2 ba
 [Model 2](old_architecture/swin_clahe.ipynb) -> 84%
 
 The following resulting AUCs discard Hernia representation in the latest model because it is difficult to measure with minimal error.
-The figures above are closer to 81% and 82% for comparison purposes because of the calculation error, but the folowing ones are more accurate:
+The figures above are closer to 81% and 82% for comparison purposes because of the calculation error, but the following ones are more accurate:
 
 [Model 3](train_save.py) -> 81.5%
 
