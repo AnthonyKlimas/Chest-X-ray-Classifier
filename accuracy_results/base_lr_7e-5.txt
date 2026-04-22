@@ -1,0 +1,566 @@
+METADATA_CSV_PATH ../chest_xray_dataset/CXR8/Data_Entry_2017_v2020.csv
+IMAGE_ROOT ../chest_xray_dataset/CXR8/images_preprocessed
+SSL_CKPT ../chest_xray_dataset/swinv2_small_1k_500k.pth
+MODEL_OUTPUT_FILE swin_cxr8_best.pth
+SAMPLER_POWER 0.17
+WARMUP_EPOCHS 3
+WARMUP_START_FACTOR 0.3
+WARMUP_END_FACTOR 1.0
+NUM_EPOCHS 48
+BASE_LR 7e-05
+HEAD_LR_MULTIPLIER 6
+LR_LAYER_DECAY 0.8
+PATIENCE 14
+VIEW_POSITION_SCALE 0.35
+ASYMMETRIC_CLIP 0.03
+GAMMA_NEG 3.0
+GAMMA_POS 1.0
+UNFREEZE_WARMUP_EPOCHS 5
+UNFREEZE_WARMUP_FACTOR 0.1
+WEIGHT_DECAY 0.01
+FEATURE_DROPOUT 0.2
+CLASSIFIER_DROPOUT 0.1
+BATCH_SIZE_VAL 16
+BATCH_SIZE_TRAIN 16
+HARDWARE_PITY 45
+UNFREEZE_SCHEDULE {6: 3, 11: 2, 17: 1, 24: 0}
+TRAIN_LOADER_WORKERS 10
+VALUE_LOADER_WORKERS 2
+PREFETECH_FACTOR 2
+PERSISTENT_WORKERS True
+2026-04-21 10:12:11.141799
+CLIP_LIMIT 1.5
+TILE_GRID_SIZE 4
+CLAHE_PROB 1.0
+HORIZONTAL_FLIP_PROB 0.5
+ROTATION_DEGREES 2.2
+ROTATION_PROB 0.5
+JITTER_BRIGHTNESS 0.08
+JITTER_CONTRAST 0.08
+IMAGENET_MEAN [0.485, 0.456, 0.406]
+IMAGENET_STD [0.229, 0.224, 0.225]
+NIH_CXR8_CUSTOM_MEAN [0.5249, 0.5249, 0.5249]
+NIH_CXR8_CUSTOM_STD [0.2622, 0.2622, 0.2622]
+CUDA available: True
+Device count: 1
+  [0] NVIDIA GeForce RTX 3070 Laptop GPU
+Using device: cuda
+**Device:  cuda
+(8, 6)
+train Hernia positives: 184
+val Hernia positives: 43
+Backbone output shape: torch.Size([1, 768])
+  Per-class AUCs:
+    Hernia               0.465
+    Mass                 0.527
+    Nodule               0.532
+    Cardiomegaly         0.564
+    Emphysema            0.568
+    Pleural_Thickening   0.573
+    No Finding           0.589
+    Effusion             0.604
+    Infiltration         0.619
+    Pneumonia            0.619
+    Atelectasis          0.628
+    Pneumothorax         0.644
+    Fibrosis             0.657
+    Consolidation        0.691
+    Edema                0.798
+  ->  saved
+Epoch 01/48  train_loss=0.0946  train_auc=0.5783  val_loss=0.0775  val_auc=0.6153
+  head_lr=2.10e-05  layer3_lr=2.10e-05
+  Per-class AUCs:
+    Hernia               0.438
+    Nodule               0.525
+    Mass                 0.535
+    Emphysema            0.550
+    Pleural_Thickening   0.587
+    Pneumonia            0.594
+    No Finding           0.610
+    Infiltration         0.616
+    Pneumothorax         0.628
+    Cardiomegaly         0.632
+    Atelectasis          0.637
+    Fibrosis             0.642
+    Effusion             0.646
+    Consolidation        0.696
+    Edema                0.817
+  ->  saved
+Epoch 02/48  train_loss=0.0942  train_auc=0.5912  val_loss=0.0804  val_auc=0.6225
+  head_lr=3.73e-05  layer3_lr=3.73e-05
+  Per-class AUCs:
+    Mass                 0.523
+    Nodule               0.530
+    Emphysema            0.562
+    Pleural_Thickening   0.595
+    Cardiomegaly         0.597
+    No Finding           0.621
+    Pneumonia            0.622
+    Infiltration         0.630
+    Fibrosis             0.640
+    Atelectasis          0.646
+    Pneumothorax         0.649
+    Effusion             0.669
+    Hernia               0.686
+    Consolidation        0.707
+    Edema                0.804
+  ->  saved
+Epoch 03/48  train_loss=0.0943  train_auc=0.5949  val_loss=0.0796  val_auc=0.6282
+  head_lr=5.37e-05  layer3_lr=5.37e-05
+  Per-class AUCs:
+    Nodule               0.532
+    Mass                 0.552
+    Emphysema            0.559
+    Pneumonia            0.574
+    Cardiomegaly         0.590
+    Pleural_Thickening   0.595
+    Fibrosis             0.619
+    Infiltration         0.623
+    No Finding           0.628
+    Pneumothorax         0.640
+    Hernia               0.641
+    Atelectasis          0.650
+    Effusion             0.679
+    Consolidation        0.707
+    Edema                0.790
+  (no improvement 1/14)
+Epoch 04/48  train_loss=0.0944  train_auc=0.5993  val_loss=0.0792  val_auc=0.6243
+  head_lr=7.00e-05  layer3_lr=7.00e-05
+  Per-class AUCs:
+    Hernia               0.499
+    Nodule               0.501
+    Emphysema            0.528
+    Mass                 0.553
+    Pleural_Thickening   0.608
+    Fibrosis             0.615
+    Pneumonia            0.615
+    Cardiomegaly         0.627
+    Infiltration         0.635
+    Atelectasis          0.642
+    No Finding           0.642
+    Pneumothorax         0.670
+    Effusion             0.683
+    Consolidation        0.725
+    Edema                0.812
+  ->  saved
+Epoch 05/48  train_loss=0.0941  train_auc=0.6032  val_loss=0.0793  val_auc=0.6325
+  head_lr=6.99e-05  layer3_lr=6.99e-05
+  Per-class AUCs:
+    Nodule               0.537
+    Mass                 0.551
+    Emphysema            0.585
+    Pleural_Thickening   0.602
+    Cardiomegaly         0.609
+    Pneumonia            0.620
+    Hernia               0.625
+    Infiltration         0.627
+    No Finding           0.630
+    Fibrosis             0.637
+    Atelectasis          0.640
+    Pneumothorax         0.648
+    Effusion             0.684
+    Consolidation        0.699
+    Edema                0.800
+  ->  saved
+Epoch 06/48  train_loss=0.0938  train_auc=0.6054  val_loss=0.0803  val_auc=0.6335
+  head_lr=6.97e-05  layer3_lr=6.97e-05
+  Per-class AUCs:
+    Hernia               0.525
+    Nodule               0.546
+    Mass                 0.558
+    Pneumonia            0.610
+    Pleural_Thickening   0.624
+    Emphysema            0.633
+    Infiltration         0.639
+    Fibrosis             0.650
+    Cardiomegaly         0.658
+    No Finding           0.661
+    Atelectasis          0.673
+    Pneumothorax         0.677
+    Effusion             0.711
+    Consolidation        0.736
+    Edema                0.817
+  ->  saved
+Epoch 07/48  train_loss=0.0935  train_auc=0.6146  val_loss=0.0785  val_auc=0.6567
+  head_lr=2.10e-06  layer3_lr=2.10e-06
+  Per-class AUCs:
+    Nodule               0.541
+    Mass                 0.585
+    Emphysema            0.601
+    Hernia               0.616
+    Pleural_Thickening   0.643
+    Fibrosis             0.648
+    Infiltration         0.649
+    Pneumonia            0.649
+    Cardiomegaly         0.669
+    No Finding           0.676
+    Atelectasis          0.680
+    Pneumothorax         0.713
+    Effusion             0.738
+    Consolidation        0.743
+    Edema                0.814
+  ->  saved
+Epoch 08/48  train_loss=0.0934  train_auc=0.6286  val_loss=0.0762  val_auc=0.6679
+  head_lr=5.88e-06  layer3_lr=5.88e-06
+  Per-class AUCs:
+    Nodule               0.539
+    Hernia               0.555
+    Mass                 0.603
+    Pleural_Thickening   0.646
+    Infiltration         0.652
+    Fibrosis             0.659
+    Pneumonia            0.664
+    Cardiomegaly         0.684
+    No Finding           0.689
+    Emphysema            0.692
+    Atelectasis          0.694
+    Pneumothorax         0.725
+    Consolidation        0.750
+    Effusion             0.757
+    Edema                0.817
+  ->  saved
+Epoch 09/48  train_loss=0.0928  train_auc=0.6426  val_loss=0.0760  val_auc=0.6836
+  head_lr=9.66e-06  layer3_lr=9.66e-06
+  Per-class AUCs:
+    Nodule               0.524
+    Mass                 0.603
+    Pneumonia            0.637
+    Fibrosis             0.649
+    Infiltration         0.654
+    Pleural_Thickening   0.678
+    Emphysema            0.684
+    Cardiomegaly         0.689
+    Atelectasis          0.699
+    No Finding           0.703
+    Hernia               0.712
+    Pneumothorax         0.745
+    Consolidation        0.751
+    Effusion             0.774
+    Edema                0.826
+  ->  saved
+Epoch 10/48  train_loss=0.0923  train_auc=0.6490  val_loss=0.0758  val_auc=0.6869
+  head_lr=1.34e-05  layer3_lr=1.34e-05
+  Per-class AUCs:
+    Nodule               0.559
+    Mass                 0.627
+    Hernia               0.645
+    Infiltration         0.658
+    Pneumonia            0.666
+    Pleural_Thickening   0.695
+    Fibrosis             0.697
+    Cardiomegaly         0.707
+    Emphysema            0.710
+    Atelectasis          0.711
+    No Finding           0.711
+    Pneumothorax         0.751
+    Consolidation        0.759
+    Effusion             0.783
+    Edema                0.830
+  ->  saved
+Epoch 11/48  train_loss=0.0921  train_auc=0.6624  val_loss=0.0739  val_auc=0.7045
+  head_lr=1.72e-05  layer3_lr=1.72e-05
+  Per-class AUCs:
+    Nodule               0.618
+    Hernia               0.653
+    Infiltration         0.666
+    Fibrosis             0.682
+    Mass                 0.684
+    Pneumonia            0.690
+    Pleural_Thickening   0.718
+    Cardiomegaly         0.723
+    Atelectasis          0.732
+    No Finding           0.740
+    Consolidation        0.771
+    Emphysema            0.786
+    Pneumothorax         0.796
+    Effusion             0.814
+    Edema                0.836
+  ->  saved
+Epoch 12/48  train_loss=0.0916  train_auc=0.6777  val_loss=0.0738  val_auc=0.7326
+  head_lr=1.69e-05  layer3_lr=1.69e-05
+  Per-class AUCs:
+    Nodule               0.660
+    Infiltration         0.669
+    Mass                 0.692
+    Pneumonia            0.709
+    Hernia               0.713
+    Fibrosis             0.736
+    Pleural_Thickening   0.745
+    No Finding           0.750
+    Cardiomegaly         0.752
+    Atelectasis          0.753
+    Consolidation        0.776
+    Pneumothorax         0.808
+    Emphysema            0.816
+    Effusion             0.836
+    Edema                0.862
+  ->  saved
+Epoch 13/48  train_loss=0.0901  train_auc=0.7029  val_loss=0.0737  val_auc=0.7545
+  head_lr=1.66e-05  layer3_lr=1.66e-05
+  Per-class AUCs:
+    Nodule               0.680
+    Infiltration         0.681
+    Mass                 0.728
+    Fibrosis             0.739
+    Hernia               0.739
+    Pneumonia            0.739
+    No Finding           0.760
+    Pleural_Thickening   0.765
+    Atelectasis          0.766
+    Cardiomegaly         0.769
+    Consolidation        0.784
+    Pneumothorax         0.830
+    Emphysema            0.837
+    Effusion             0.851
+    Edema                0.873
+  ->  saved
+Epoch 14/48  train_loss=0.0887  train_auc=0.7299  val_loss=0.0714  val_auc=0.7715
+  head_lr=1.62e-05  layer3_lr=1.62e-05
+  Per-class AUCs:
+    Infiltration         0.685
+    Hernia               0.702
+    Nodule               0.702
+    Pneumonia            0.754
+    Fibrosis             0.758
+    Mass                 0.762
+    No Finding           0.767
+    Pleural_Thickening   0.771
+    Atelectasis          0.775
+    Consolidation        0.791
+    Cardiomegaly         0.816
+    Pneumothorax         0.844
+    Effusion             0.863
+    Emphysema            0.864
+    Edema                0.876
+  ->  saved
+Epoch 15/48  train_loss=0.0876  train_auc=0.7507  val_loss=0.0720  val_auc=0.7878
+  head_lr=1.58e-05  layer3_lr=1.58e-05
+  Per-class AUCs:
+    Infiltration         0.688
+    Nodule               0.728
+    Hernia               0.732
+    Fibrosis             0.745
+    Pneumonia            0.748
+    Pleural_Thickening   0.770
+    No Finding           0.773
+    Atelectasis          0.787
+    Consolidation        0.797
+    Mass                 0.800
+    Cardiomegaly         0.852
+    Pneumothorax         0.864
+    Effusion             0.869
+    Edema                0.870
+    Emphysema            0.878
+  ->  saved
+Epoch 16/48  train_loss=0.0864  train_auc=0.7674  val_loss=0.0720  val_auc=0.7977
+  head_lr=1.54e-05  layer3_lr=1.54e-05
+  Per-class AUCs:
+    Hernia               0.648
+    Infiltration         0.689
+    Fibrosis             0.719
+    Nodule               0.738
+    Pneumonia            0.760
+    No Finding           0.774
+    Pleural_Thickening   0.782
+    Atelectasis          0.789
+    Consolidation        0.795
+    Mass                 0.811
+    Pneumothorax         0.864
+    Effusion             0.868
+    Cardiomegaly         0.869
+    Edema                0.874
+    Emphysema            0.893
+  ->  saved
+Epoch 17/48  train_loss=0.0854  train_auc=0.7838  val_loss=0.0712  val_auc=0.8018
+  head_lr=1.49e-05  layer3_lr=1.49e-05
+  Per-class AUCs:
+    Hernia               0.632
+    Infiltration         0.698
+    Nodule               0.743
+    Pneumonia            0.756
+    Fibrosis             0.764
+    No Finding           0.777
+    Consolidation        0.792
+    Pleural_Thickening   0.792
+    Atelectasis          0.799
+    Mass                 0.824
+    Effusion             0.872
+    Cardiomegaly         0.873
+    Pneumothorax         0.875
+    Edema                0.876
+    Emphysema            0.899
+  ->  saved
+Epoch 18/48  train_loss=0.0844  train_auc=0.7941  val_loss=0.0704  val_auc=0.8100
+  head_lr=1.44e-05  layer3_lr=1.44e-05
+  Per-class AUCs:
+    Hernia               0.651
+    Infiltration         0.698
+    Nodule               0.739
+    Pneumonia            0.756
+    Fibrosis             0.764
+    No Finding           0.780
+    Pleural_Thickening   0.784
+    Consolidation        0.794
+    Atelectasis          0.807
+    Mass                 0.815
+    Effusion             0.869
+    Cardiomegaly         0.873
+    Pneumothorax         0.874
+    Edema                0.879
+    Emphysema            0.902
+  (no improvement 1/14)
+Epoch 19/48  train_loss=0.0836  train_auc=0.8064  val_loss=0.0703  val_auc=0.8095
+  head_lr=1.39e-05  layer3_lr=1.39e-05
+  Per-class AUCs:
+    Hernia               0.678
+    Infiltration         0.701
+    Nodule               0.746
+    Pneumonia            0.766
+    Fibrosis             0.778
+    No Finding           0.781
+    Consolidation        0.791
+    Pleural_Thickening   0.791
+    Atelectasis          0.797
+    Mass                 0.824
+    Effusion             0.872
+    Cardiomegaly         0.875
+    Pneumothorax         0.881
+    Edema                0.886
+    Emphysema            0.903
+  ->  saved
+Epoch 20/48  train_loss=0.0829  train_auc=0.8162  val_loss=0.0709  val_auc=0.8137
+  head_lr=1.34e-05  layer3_lr=1.34e-05
+  Per-class AUCs:
+    Infiltration         0.701
+    Hernia               0.718
+    Pneumonia            0.743
+    Nodule               0.749
+    No Finding           0.779
+    Fibrosis             0.784
+    Pleural_Thickening   0.787
+    Consolidation        0.801
+    Atelectasis          0.803
+    Mass                 0.823
+    Cardiomegaly         0.869
+    Effusion             0.874
+    Pneumothorax         0.882
+    Edema                0.886
+    Emphysema            0.903
+  (no improvement 1/14)
+Epoch 21/48  train_loss=0.0821  train_auc=0.8250  val_loss=0.0711  val_auc=0.8131
+  head_lr=1.28e-05  layer3_lr=1.28e-05
+  Per-class AUCs:
+    Hernia               0.668
+    Infiltration         0.705
+    Nodule               0.756
+    Pneumonia            0.764
+    Fibrosis             0.770
+    No Finding           0.783
+    Consolidation        0.794
+    Pleural_Thickening   0.794
+    Atelectasis          0.811
+    Mass                 0.816
+    Effusion             0.874
+    Pneumothorax         0.876
+    Cardiomegaly         0.880
+    Edema                0.888
+    Emphysema            0.897
+  ->  saved
+Epoch 22/48  train_loss=0.0813  train_auc=0.8317  val_loss=0.0702  val_auc=0.8148
+  head_lr=1.23e-05  layer3_lr=1.23e-05
+  Per-class AUCs:
+    Hernia               0.684
+    Infiltration         0.702
+    Nodule               0.731
+    Fibrosis             0.766
+    Pneumonia            0.770
+    No Finding           0.779
+    Consolidation        0.793
+    Pleural_Thickening   0.795
+    Atelectasis          0.807
+    Mass                 0.829
+    Effusion             0.867
+    Cardiomegaly         0.868
+    Pneumothorax         0.877
+    Edema                0.882
+    Emphysema            0.904
+  (no improvement 1/14)
+Epoch 23/48  train_loss=0.0805  train_auc=0.8401  val_loss=0.0697  val_auc=0.8122
+  head_lr=1.17e-05  layer3_lr=1.17e-05
+  Per-class AUCs:
+    Infiltration         0.704
+    Hernia               0.742
+    Pneumonia            0.742
+    Nodule               0.747
+    No Finding           0.781
+    Fibrosis             0.787
+    Consolidation        0.792
+    Pleural_Thickening   0.798
+    Atelectasis          0.809
+    Mass                 0.817
+    Effusion             0.870
+    Cardiomegaly         0.871
+    Pneumothorax         0.874
+    Edema                0.879
+    Emphysema            0.908
+  (no improvement 2/14)
+Epoch 24/48  train_loss=0.0800  train_auc=0.8457  val_loss=0.0712  val_auc=0.8129
+  head_lr=1.11e-05  layer3_lr=1.11e-05
+  Per-class AUCs:
+    Infiltration         0.698
+    Hernia               0.732
+    Pneumonia            0.747
+    Nodule               0.752
+    Fibrosis             0.766
+    No Finding           0.778
+    Consolidation        0.793
+    Pleural_Thickening   0.793
+    Atelectasis          0.804
+    Mass                 0.820
+    Cardiomegaly         0.864
+    Pneumothorax         0.868
+    Effusion             0.870
+    Edema                0.876
+    Emphysema            0.888
+  (no improvement 3/14)
+Epoch 25/48  train_loss=0.0794  train_auc=0.8493  val_loss=0.0713  val_auc=0.8084
+  head_lr=1.05e-05  layer3_lr=1.05e-05
+  Per-class AUCs:
+    Infiltration         0.706
+    Hernia               0.734
+    Pneumonia            0.735
+    Nodule               0.746
+    Fibrosis             0.754
+    No Finding           0.779
+    Consolidation        0.786
+    Pleural_Thickening   0.792
+    Atelectasis          0.807
+    Mass                 0.811
+    Effusion             0.865
+    Cardiomegaly         0.868
+    Pneumothorax         0.868
+    Edema                0.880
+    Emphysema            0.911
+  (no improvement 4/14)
+Epoch 26/48  train_loss=0.0787  train_auc=0.8565  val_loss=0.0706  val_auc=0.8077
+  head_lr=9.91e-06  layer3_lr=9.91e-06
+  Per-class AUCs:
+    Infiltration         0.711
+    Hernia               0.730
+    Pneumonia            0.740
+    Nodule               0.749
+    Fibrosis             0.764
+    No Finding           0.780
+    Consolidation        0.787
+    Pleural_Thickening   0.789
+    Mass                 0.804
+    Atelectasis          0.806
+    Cardiomegaly         0.866
+    Effusion             0.870
+    Edema                0.871
+    Pneumothorax         0.874
+    Emphysema            0.907
+  (no improvement 5/14)
+Epoch 27/48  train_loss=0.0780  train_auc=0.8615  val_loss=0.0706  val_auc=0.8086
+  head_lr=9.31e-06  layer3_lr=9.31e-06
+train:  26%|##6       | 1570/5952 [06:15<17:57,  4.07it/s]
