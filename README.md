@@ -41,7 +41,7 @@ Hernia               | ▏ 227
 ```
 Mean: ```5798.3```
 
-Standard Deviation: ```5429.592```
+Standard Deviation: ```5429.6```
 
 
 ### Authors:
