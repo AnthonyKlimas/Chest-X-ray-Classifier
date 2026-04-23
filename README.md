@@ -5,6 +5,7 @@
 In this project, we attempt to tune a preprocessing pipeline, a SimMIM SwinV2 backbone, and a MLP head to push AUC to 84%
 
 
+
 ### Install
 
 Use Python 3.11
@@ -13,9 +14,16 @@ Use Python 3.11
 ```pip install -r requirements.txt```
 
 
+Beyond Python there are two other dependencies:
+
+  [NIH Chest X-ray dataset](https://nihcc.app.box.com/v/ChestXray-NIHCC) (42 GB)
+  
+  [Microsoft SimMIM Swin small checkpoint](https://huggingface.co/zdaxie/SimMIM/blob/main/simmim_swinv2_pretrain_models/swinv2_small_1k_500k.pth) (.2 GB)
+
+
 ### Run
 
-Use the 3.11 interpreter to run train.py. No arguments needed
+Use the 3.11 interpreter to run train.py. No arguments are needed.
 
 ```python train.py```
 
