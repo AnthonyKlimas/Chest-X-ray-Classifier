@@ -31,12 +31,12 @@ import pandas as pd
 import torch.nn as nn
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
+from skmultilearn.model_selection import IterativeStratification
 from sklearn.preprocessing import MultiLabelBinarizer
 from torch.amp import autocast
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 
-from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
 
 
 
@@ -237,50 +237,26 @@ def init_device():
     return device
 
 
-def layer_unfreeze_epoch(layer_idx, schedule):
-    if layer_idx < 0:
-        return 1
-    for epoch in sorted(schedule.keys()):
-        if schedule[epoch] >= layer_idx:
-            return epoch
-    return 1
-
-def make_lr_lambda(unfreeze_epoch, base_lr):
-    eta_ratio = 0.0  # allow full decay to 0
-    cosine_span = max(NUM_EPOCHS - unfreeze_epoch - UNFREEZE_WARMUP_EPOCHS, 1)
-
-    def lr_lambda(epoch):
-        e = epoch + 1
-        if e < unfreeze_epoch:
-            return 0.0
-        warmup_frac = (e - unfreeze_epoch) / UNFREEZE_WARMUP_EPOCHS
-        if warmup_frac < 1.0:
-            return UNFREEZE_WARMUP_FACTOR + (1 - UNFREEZE_WARMUP_FACTOR) * warmup_frac
-        cosine_e = e - unfreeze_epoch - UNFREEZE_WARMUP_EPOCHS
-        cos = 0.5 * (1 + math.cos(math.pi * cosine_e / cosine_span))
-        return eta_ratio + (1 - eta_ratio) * cos
-
-    return lr_lambda
-
-
-
 def init_split(df, label_matrix):
     patient_ids = df["Patient ID"].unique()
 
-    # For each patient, OR together all their image labels
     patient_label_matrix = np.zeros((len(patient_ids), len(ALL_CLASSES)), dtype=int)
     patient_id_to_idx = {pid: i for i, pid in enumerate(patient_ids)}
-
 
     for img_idx, pid in enumerate(df["Patient ID"]):
         p = patient_id_to_idx[pid]
         patient_label_matrix[p] |= label_matrix[img_idx]
 
-    # Stratified split at patient level
-    # Use patient who have been diagnosed later with hernia,
-    # but have previous undiagnosed images
-    msss = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=0.15, random_state=42)
-    train_patient_idx, val_patient_idx = next(msss.split(patient_ids, patient_label_matrix))
+    # skmultilearn replacement — note it needs a sparse-compatible array
+    stratifier = IterativeStratification(
+        n_splits=2,                        # 2-fold gives one train/val split
+        order=1,
+        sample_distribution_per_fold=[0.15, 0.85],  # val=15%, train=85%
+    )
+    # Returns (larger_fold, smaller_fold) — val is first here
+    val_patient_idx, train_patient_idx = next(
+        stratifier.split(patient_ids.reshape(-1, 1), patient_label_matrix)
+    )
 
     train_patients = set(patient_ids[train_patient_idx])
     value_patients = set(patient_ids[val_patient_idx])
@@ -288,12 +264,12 @@ def init_split(df, label_matrix):
     train_idx = df[df["Patient ID"].isin(train_patients)].index.to_numpy()
     value_idx = df[df["Patient ID"].isin(value_patients)].index.to_numpy()
 
-    # Verify Hernia representation improved
     for split_name, idx in [("train", train_idx), ("val", value_idx)]:
         n_hernia = label_matrix[idx, ALL_CLASSES.index("Hernia")].sum()
         print(f"{split_name} Hernia positives: {n_hernia}")
-    
+
     return train_idx, value_idx
+
 
 # Loads the SSL checkpoint from the path SSL_CKPT
 def init_ckpt(model, path):
@@ -331,6 +307,35 @@ def init_ckpt(model, path):
     print("Loaded SSL checkpoint. Missing:", missing, "Unexpected:", unexpected)
     
     # no need to return ckpt, set in load_state_dict
+
+
+
+
+def layer_unfreeze_epoch(layer_idx, schedule):
+    if layer_idx < 0:
+        return 1
+    for epoch in sorted(schedule.keys()):
+        if schedule[epoch] >= layer_idx:
+            return epoch
+    return 1
+
+def make_lr_lambda(unfreeze_epoch, base_lr):
+    eta_ratio = 0.0  # allow full decay to 0
+    cosine_span = max(NUM_EPOCHS - unfreeze_epoch - UNFREEZE_WARMUP_EPOCHS, 1)
+
+    def lr_lambda(epoch):
+        e = epoch + 1
+        if e < unfreeze_epoch:
+            return 0.0
+        warmup_frac = (e - unfreeze_epoch) / UNFREEZE_WARMUP_EPOCHS
+        if warmup_frac < 1.0:
+            return UNFREEZE_WARMUP_FACTOR + (1 - UNFREEZE_WARMUP_FACTOR) * warmup_frac
+        cosine_e = e - unfreeze_epoch - UNFREEZE_WARMUP_EPOCHS
+        cos = 0.5 * (1 + math.cos(math.pi * cosine_e / cosine_span))
+        return eta_ratio + (1 - eta_ratio) * cos
+
+    return lr_lambda
+
 
 
 def verify_label_alignment(df, label_matrix, mlb, sample_indices=None):
