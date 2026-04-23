@@ -5,6 +5,22 @@
 In this project, we attempt to tune a preprocessing pipeline, a SimMIM SwinV2 backbone, and a MLP head to push AUC to 84%
 
 
+### Install
+
+Use Python 3.11
+```python --version```
+
+```pip install -r requirements.txt```
+
+
+### Run
+
+Use the 3.11 interpreter to run train.py. No arguments needed
+
+```python train.py```
+
+This will output a best checkpoint and log file.
+
 
 ### Results
 [Model 1](old_architecture/swin.ipynb)  ->  ~83%
