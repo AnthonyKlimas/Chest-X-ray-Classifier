@@ -17,12 +17,13 @@ A MLP is used as the head.
 Note one definite inaccuracy: Hernia has such few entries
 that the value test will not yield a valid result. 
 """
+import csv
 import datetime
 import math
 import os
 import glob
+import sys
 import time
-import math
 import cv2
 import numpy as np
 import pandas as pd
@@ -30,10 +31,8 @@ import pandas as pd
 import torch.nn as nn
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
-from torchvision import transforms
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MultiLabelBinarizer
-from torch.amp import GradScaler, autocast
+from torch.amp import autocast
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 
@@ -50,6 +49,7 @@ from dataset import (
 )
 
 from swin_transformer_v2 import SwinTransformerV2
+from visualization import GradCAM, visualize_class
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
@@ -76,20 +76,23 @@ PATIENCE = 14
 
 # Loss Parameters
 GAMMA_POS  = 1.0
-GAMMA_NEG  = 3.0
-ASYMMETRIC_CLIP = 0.03
+GAMMA_NEG  = 2.0
+ASYMMETRIC_CLIP = 0.05
+# LABEL_SMOOTH = 0.0
+
+ATTN_WARMUP_EPOCHS = 1
 
 # BASE_LR = 5e-5
 BASE_LR = 7e-5
 # No pretraining for head
 # Multiply the BASE_LR to compensate
-HEAD_LR_MULTIPLIER = 6
+HEAD_LR_MULTIPLIER = 5
 
 LR_LAYER_DECAY = 0.8
 WEIGHT_DECAY = 1e-2
 
 # Sample extra from low appearing catagories
-SAMPLER_POWER = 0.17
+SAMPLER_POWER = 0.19
 
 
 VIEW_POSITION_SCALE = 0.35
@@ -99,11 +102,21 @@ CLASSIFIER_DROPOUT = 0.1
 
 # Unfreeze the backbone stages slowly
 UNFREEZE_SCHEDULE = {
-     6: 3,
-    11: 2,
-    17: 1,
-    24: 0,
+     3: 0,
+     7: 1,
+    12: 2,
+    18: 3,
 }
+
+# considering a schedule like this:
+# UNFREEZE_SCHEDULE = {
+#     2: 0,
+#     5: 1,
+#     9: 2,
+#     14: 3,
+# }
+
+
 UNFREEZE_WARMUP_EPOCHS = 5
 UNFREEZE_WARMUP_FACTOR = 0.1
 
@@ -134,6 +147,23 @@ NUM_CLASSES = len(ALL_CLASSES)
 # Check point file labels that aren't required
 EXPECTED_MISSING = {"relative_coords_table", "relative_position_index", "attn_mask"}
 
+def get_class_attention(model, img_tensor, class_idx, device, view_id=0):
+    model.eval()
+    with torch.no_grad():
+        feats = model.backbone.forward_features(img_tensor.unsqueeze(0).to(device))
+        view_id = torch.tensor([view_id], dtype=torch.long, device=device)
+        v = model.view_mlp(model.view_embed(view_id))
+        gamma, beta = v.chunk(2, dim=-1)
+        scale = torch.sigmoid(model.view_scale) * 2.0
+        feats = feats * (1 + scale * gamma.unsqueeze(1)) + beta.unsqueeze(1)
+
+        normed = model.attn_pool.norm(feats)
+        attn = model.attn_pool.query(normed)                            # (1, N, num_classes)
+        attn = torch.softmax(attn / model.attn_pool.temp.clamp(min=0.1), dim=1)
+        attn_map = attn[0, :, class_idx]                                # (N,)
+
+    H = W = int(attn_map.shape[0] ** 0.5)
+    return attn_map.reshape(H, W).cpu().numpy()
 
 # Logging and tuning purposes
 def print_train_parameters():
@@ -151,6 +181,8 @@ def print_train_parameters():
     print("ASYMMETRIC_CLIP", ASYMMETRIC_CLIP)
     print("GAMMA_NEG", GAMMA_NEG)
     print("GAMMA_POS", GAMMA_POS)
+    # print("LABEL_SMOOTH",LABEL_SMOOTH)
+    print("ATTN_WARMUP_EPOCHS", ATTN_WARMUP_EPOCHS)
     print("UNFREEZE_WARMUP_EPOCHS", UNFREEZE_WARMUP_EPOCHS)
     print("UNFREEZE_WARMUP_FACTOR",UNFREEZE_WARMUP_FACTOR)
     print("WEIGHT_DECAY", WEIGHT_DECAY)
@@ -169,13 +201,25 @@ def print_train_parameters():
 
 def init_metadata(path):
     df = pd.read_csv(path)
-    df = df[["Image Index", "Finding Labels",
-             "View Position", "Patient ID"]].copy()
-    df["view_id"] = df["View Position"].map({"PA": 0, "AP": 1}).fillna(0).astype(int)
+    df = df[["Image Index", "Finding Labels", "View Position", "Patient ID"]].copy()
     df = df[df["View Position"].isin(["PA", "AP"])].reset_index(drop=True)
-    df["labels"] = df["Finding Labels"].str.split("|")
     
+    # No fillna — if something slipped past the filter above, we want to know
+    df["view_id"] = df["View Position"].map({"PA": 0, "AP": 1})
+    assert df["view_id"].isna().sum() == 0, "Unexpected view positions found after filter"
+    df["view_id"] = df["view_id"].astype(int)
+    
+    df["labels"] = df["Finding Labels"].str.split("|")
     return df
+
+def init_sampler(label_matrix, train_idx):
+    active_cols = [i for i in range(len(ALL_CLASSES)) if i != NO_FINDING_COL]
+    train_labels_active = label_matrix[train_idx][:, active_cols]
+    class_weights = 1.0 / (train_labels_active.sum(axis=0) + 1e-6)
+    sample_weights = (train_labels_active * class_weights).max(axis=1) ** SAMPLER_POWER
+    sample_weights = np.clip(sample_weights, a_min=sample_weights[sample_weights > 0].min(), a_max=None)
+    sample_weights = sample_weights / sample_weights.mean()
+    return WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
 
 def init_device():
     torch.cuda.empty_cache()
@@ -194,16 +238,16 @@ def init_device():
 
 
 def layer_unfreeze_epoch(layer_idx, schedule):
-    if layer_idx < 0:        # head, view embed, attn_pool — always live
+    if layer_idx < 0:
         return 1
     for epoch in sorted(schedule.keys()):
-        if layer_idx >= schedule[epoch]:
+        if schedule[epoch] >= layer_idx:
             return epoch
     return 1
 
 def make_lr_lambda(unfreeze_epoch, base_lr):
-    eta_ratio = 1e-6 / base_lr
-    cosine_span = NUM_EPOCHS - unfreeze_epoch - UNFREEZE_WARMUP_EPOCHS
+    eta_ratio = 0.0  # allow full decay to 0
+    cosine_span = max(NUM_EPOCHS - unfreeze_epoch - UNFREEZE_WARMUP_EPOCHS, 1)
 
     def lr_lambda(epoch):
         e = epoch + 1
@@ -213,10 +257,12 @@ def make_lr_lambda(unfreeze_epoch, base_lr):
         if warmup_frac < 1.0:
             return UNFREEZE_WARMUP_FACTOR + (1 - UNFREEZE_WARMUP_FACTOR) * warmup_frac
         cosine_e = e - unfreeze_epoch - UNFREEZE_WARMUP_EPOCHS
-        cos = 0.5 * (1 + math.cos(math.pi * cosine_e / max(cosine_span, 1)))
+        cos = 0.5 * (1 + math.cos(math.pi * cosine_e / cosine_span))
         return eta_ratio + (1 - eta_ratio) * cos
 
     return lr_lambda
+
+
 
 def init_split(df, label_matrix):
     patient_ids = df["Patient ID"].unique()
@@ -224,8 +270,10 @@ def init_split(df, label_matrix):
     # For each patient, OR together all their image labels
     patient_label_matrix = np.zeros((len(patient_ids), len(ALL_CLASSES)), dtype=int)
     patient_id_to_idx = {pid: i for i, pid in enumerate(patient_ids)}
-    for img_idx, row in df.iterrows():
-        p = patient_id_to_idx[row["Patient ID"]]
+
+
+    for img_idx, pid in enumerate(df["Patient ID"]):
+        p = patient_id_to_idx[pid]
         patient_label_matrix[p] |= label_matrix[img_idx]
 
     # Stratified split at patient level
@@ -280,103 +328,191 @@ def init_ckpt(model, path):
             print(f"  {k}")
 
     # May be source of error if wrong ssl checkpoint file is used
-    # print("Loaded SSL checkpoint. Missing:", missing, "Unexpected:", unexpected)
+    print("Loaded SSL checkpoint. Missing:", missing, "Unexpected:", unexpected)
     
     # no need to return ckpt, set in load_state_dict
 
+
+def verify_label_alignment(df, label_matrix, mlb, sample_indices=None):
+    """
+    Verifies that df and label_matrix are aligned after masking.
+    Raises AssertionError immediately if anything is off.
+    """
+    assert len(df) == len(label_matrix), \
+        f"Length mismatch: df={len(df)}, label_matrix={len(label_matrix)}"
+
+    if sample_indices is None:
+        n = len(df)
+        sample_indices = sorted({0, n//4, n//2, 3*n//4, n-1})
+
+    for i in sample_indices:
+        raw = df.loc[i, "labels"]
+        labels_list = raw.split("|") if isinstance(raw, str) else raw
+        expected = mlb.transform([labels_list])[0]
+        assert np.array_equal(label_matrix[i], expected), \
+            f"Label mismatch at row {i}: got {label_matrix[i]}, expected {expected}"
+
+    print(f"Label alignment verified across {len(sample_indices)} sampled rows.")
+
+
+def verify_dataset_alignment(ds, label_matrix, idx_array):
+    checkpoints = [0, len(ds)//2, len(ds)-1]
+    for check_i in checkpoints:
+        _, lbl, _ = ds[check_i]
+        assert np.array_equal(lbl.numpy(), label_matrix[idx_array[check_i]]), \
+            f"Dataset label mismatch at ds[{check_i}]"
+    print(f"Dataset alignment verified at indices {checkpoints}.")
+
+
 # Loss
 class AsymmetricLoss(nn.Module):
-    def __init__(self, gamma_pos=1, gamma_neg=4, clip=0.05,
-                 eps=1e-8,  label_smooth=0.05):
+    def __init__(
+        self,
+        gamma_pos=1.0,
+        gamma_neg=2.0,
+        clip=0.05,
+        eps=1e-8,
+        disable_torch_grad_focal_loss=True,
+    ):
         super().__init__()
         self.gamma_pos = gamma_pos
         self.gamma_neg = gamma_neg
         self.clip = clip
         self.eps = eps
-        self.label_smooth = label_smooth
-
+        self.disable_torch_grad_focal_loss = disable_torch_grad_focal_loss
+        mask = torch.ones(NUM_CLASSES)
+        mask[NO_FINDING_COL] = 0.0
+        self.register_buffer("loss_mask", mask)
 
     def forward(self, logits, targets):
+        # Sigmoid
         probs = torch.sigmoid(logits)
 
-        # Clip negative probabilities
-        if self.clip > 0:
-            probs_neg = (1 - probs - self.clip).clamp(min=0)
-        else:
-            probs_neg = 1 - probs
+        # Positive / negative probabilities
+        xs_pos = probs
+        xs_neg = 1 - probs
+
+        # Asymmetric clipping (ONLY negatives)
+        if self.clip is not None and self.clip > 0:
+            xs_neg = (xs_neg + self.clip).clamp(max=1)
+
+        # Log terms
+        log_pos = torch.log(xs_pos.clamp(min=self.eps))
+        log_neg = torch.log(xs_neg.clamp(min=self.eps))
+
+        # Basic CE loss
+        loss = targets * log_pos + (1 - targets) * log_neg
+        loss = loss * self.loss_mask
+
 
         # Asymmetric focusing
-        pos_focal = (1 - probs) ** self.gamma_pos
-        neg_focal = probs ** self.gamma_neg
+        if self.gamma_pos > 0 or self.gamma_neg > 0:
+            if self.disable_torch_grad_focal_loss:
+                with torch.no_grad():
+                    pt_pos = xs_pos * targets
+                    pt_neg = xs_neg * (1 - targets)
+                    pt = pt_pos + pt_neg
+                    gamma = self.gamma_pos * targets + self.gamma_neg * (1 - targets)
+                    focal_weight = (1 - pt) ** gamma
+            else:
+                pt_pos = xs_pos * targets
+                pt_neg = xs_neg * (1 - targets)
+                pt = pt_pos + pt_neg
+                gamma = self.gamma_pos * targets + self.gamma_neg * (1 - targets)
+                focal_weight = (1 - pt) ** gamma
 
-        if self.label_smooth > 0:
-                    targets = targets * (1 - self.label_smooth) + 0.5 * self.label_smooth
+            loss *= focal_weight
 
-        # Loss
-        loss_pos = targets * torch.log(probs.clamp(min=self.eps)) * pos_focal
-        loss_neg = (1 - targets) * torch.log(probs_neg.clamp(min=self.eps)) * neg_focal
+        active = self.loss_mask.sum() * logits.shape[0]
+        return -loss.sum() / active    
 
-        loss = -(loss_pos + loss_neg).mean()
-        return loss
+class ClassSpecificAttnPool(nn.Module):
+    """
+    Each class learns its own spatial attention query.
+    Input:  feats  (B, N, C)
+    Output: pooled (B, num_classes, C)
+    """
+    def __init__(self, C, num_classes):
+        super().__init__()
+        self.norm = nn.LayerNorm(C)
+        # One query per class
+        self.query = nn.Linear(C, num_classes, bias=False)
+        self.temp   = nn.Parameter(torch.ones(1))
+
+    def forward(self, feats):
+        # feats: (B, N, C)
+        feats = self.norm(feats)
+        # Attention logits per class: (B, N, num_classes)
+        attn = self.query(feats) / self.temp.clamp(min=0.1)
+        attn = torch.softmax(attn, dim=1)           # softmax over N
+        # Weighted sum per class: (B, num_classes, C)
+        pooled = torch.einsum("bnc,bnk->bkc", feats, attn)
+        return pooled  # (B, num_classes, C)
 
 
-# Model Wrapper
-class SwinWithView(torch.nn.Module):
+class SwinWithView(nn.Module):
     def __init__(self, backbone, num_classes):
         super().__init__()
         C = backbone.norm.normalized_shape[0]
         backbone.head = nn.Identity()
         self.backbone = backbone
-        self.attn_pool = torch.nn.Sequential(
-            torch.nn.LayerNorm(C),
-            torch.nn.Linear(C, 128),
-            torch.nn.GELU(),
-            torch.nn.Linear(128, 1)
+        self.num_classes = num_classes
+        self.use_attention = True 
+
+        # --- Class-specific pooling replaces attn_pool ---
+        self.attn_pool = ClassSpecificAttnPool(C, num_classes)
+
+        # View conditioning (unchanged)
+        self.view_embed = nn.Embedding(2, 32)
+        self.view_mlp   = nn.Sequential(
+            nn.Linear(32, 128),
+            nn.GELU(),
+            nn.Linear(128, C * 2)
         )
-        
-        self.view_embed = torch.nn.Embedding(2, 32)
-        self.view_mlp = torch.nn.Sequential(
-            torch.nn.Linear(32, 128),
-            torch.nn.GELU(),
-            torch.nn.Linear(128, C * 2)
-        )
-        self.attn_temp  = torch.nn.Parameter(torch.tensor(1.0))
-        self.view_scale = torch.nn.Parameter(torch.tensor(VIEW_POSITION_SCALE))
+        self.view_scale = nn.Parameter(torch.tensor(VIEW_POSITION_SCALE))
+
         nn.init.zeros_(self.view_mlp[-1].weight)
         nn.init.zeros_(self.view_mlp[-1].bias)
-        nn.init.zeros_(self.attn_pool[-1].weight)
-        nn.init.zeros_(self.attn_pool[-1].bias)
 
-        # Multi-classifier head
-        self.head = torch.nn.Sequential(
-            torch.nn.LayerNorm(C),
-            torch.nn.Dropout(FEATURE_DROPOUT),
-            torch.nn.Linear(C, 768),
-            torch.nn.GELU(),
-            torch.nn.Dropout(CLASSIFIER_DROPOUT),
-            torch.nn.Linear(768, 512),
-            torch.nn.GELU(),
-            torch.nn.Linear(512, num_classes),
-        )
+        # Per-class head: each class gets its own (C -> 1) projection
+        # implemented efficiently as a single Linear(C, num_classes)
+        self.head = nn.Linear(C, num_classes)
+
+        # self.head = nn.Sequential(
+        #     nn.LayerNorm(C),
+        #     nn.Dropout(FEATURE_DROPOUT),
+        #     nn.Linear(C, 512),
+        #     nn.GELU(),
+        #     nn.Dropout(CLASSIFIER_DROPOUT),
+        #     nn.Linear(512, 1),   # applied per class independently
+        # )
 
     def forward(self, x, view_id):
-        feats = self.backbone.forward_features(x)  # (B, N, C)
+        feats = self.backbone.forward_features(x)   # (B, N, C)
 
-        if feats.ndim == 3:
-            B, N, C = feats.shape
-            attn = self.attn_pool(feats).squeeze(-1)
-            temp = self.attn_temp.clamp(min=0.1)
-            attn = torch.softmax(attn / temp, dim=1)
-            feats = (feats * attn.unsqueeze(-1)).sum(dim=1)
-
-
-        v = self.view_mlp(self.view_embed(view_id))
-        gamma, beta = v.chunk(2, dim=-1)
-
+        # View conditioning: modulate the spatial tokens before pooling
+        # so each class-query sees view-conditioned features
+        v = self.view_mlp(self.view_embed(view_id))  # (B, C*2)
+        gamma, beta = v.chunk(2, dim=-1)             # each (B, C)
         scale = torch.sigmoid(self.view_scale) * 2.0
-        feats = feats * (1 + scale * gamma) + beta
-        return self.head(feats)
+        # Broadcast over N
+        feats = feats * (1 + scale * gamma.unsqueeze(1)) + beta.unsqueeze(1)
 
+        if self.use_attention:
+            pooled = self.attn_pool(feats)  # (B, K, C)
+        else:
+            B, N, C = feats.shape
+            pooled = feats.mean(dim=1, keepdim=True)        # (B, 1, C)
+            pooled = pooled.expand(-1, self.num_classes, -1)  # (B, K, C)
+
+        # Apply head to each class's feature vector
+        # Reshape to (B * num_classes, C), run head, reshape back
+        B, K, C = pooled.shape
+        pooled_flat = pooled.reshape(B * K, C)
+        logits = self.head(pooled_flat).squeeze(-1)  # (B * num_classes)
+        logits = logits.reshape(B, K)                # (B, num_classes)
+
+        return logits
 
 # Param Groups
 def init_param_groups(model, base_lr=1e-4, decay=0.8, schedule=None):
@@ -398,21 +534,22 @@ def init_param_groups(model, base_lr=1e-4, decay=0.8, schedule=None):
                 groups.append({
                     "params": bucket,
                     "lr": lr,
-                    "base_lr": lr,           # stored for lambda scaling
+                    "base_lr": lr, # stored for lambda scaling
                     "layer_idx": layer_idx,
                     "unfreeze_epoch": ue,
                     "weight_decay": wdv,
                 })
 
     layers = list(model.backbone.layers)
-    for i, layer in enumerate(layers):
-        add(layer.parameters(), base_lr * (decay ** i), i)
+    n_layers = len(model.backbone.layers)
+    for i, layer in enumerate(model.backbone.layers):
+        add(layer.parameters(), base_lr * (decay ** (n_layers - 1 - i)), i)
 
     add(model.head.parameters(),       base_lr * HEAD_LR_MULTIPLIER, -1)
     add(model.view_embed.parameters(), base_lr, -1)
     add(model.view_mlp.parameters(),   base_lr, -1)
-    add(model.attn_pool.parameters(),  base_lr, -1)
-    add([model.attn_temp, model.view_scale], base_lr, -1)
+    add(model.attn_pool.parameters(), base_lr * 2, -1)
+    add([model.view_scale], base_lr, -1)
 
     leftovers = [p for p in model.parameters() if id(p) not in seen]
     if leftovers:
@@ -445,6 +582,10 @@ if __name__ == "__main__":
     df = df[mask].reset_index(drop=True)
     label_matrix = label_matrix[mask.values]
 
+    verify_label_alignment(df, label_matrix, mlb)
+
+
+
     # Split
     # split by Patient so value tests hasn't been trained on the same patients
     # This causes an auc decrease of about 0.01 but is a more accurate test
@@ -456,23 +597,35 @@ if __name__ == "__main__":
     train_tf = make_train_tf(256)
     
     train_ds = CXR8Dataset(df, label_matrix, train_idx, train_tf, path_lookup)
-    value_ds   = CXR8Dataset(df, label_matrix, value_idx,   value_tf,   path_lookup)
-    
+    value_ds = CXR8Dataset(df, label_matrix, value_idx,   value_tf,   path_lookup)
+        
     # After building train_ds, verify alignment:
-    img, lbl, view = train_ds[0]
-    expected_label = label_matrix[train_idx[0]]
-    assert np.array_equal(lbl.numpy(), expected_label), "Label mismatch!"
+    verify_dataset_alignment(train_ds, label_matrix, train_idx)
+
 
     # Sampler
-    class_counts = label_matrix[train_idx].sum(axis=0)
-    class_weights = 1.0 / (class_counts + 1e-6) ** SAMPLER_POWER
-    sample_weights = (label_matrix[train_idx] * class_weights).sum(axis=1)
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True,
-    )
+    # Exclude No Finding from sampler weighting — it's masked in loss
+    active_cols = [i for i in range(len(ALL_CLASSES)) if i != NO_FINDING_COL]
+    train_labels_active = label_matrix[train_idx][:, active_cols]
 
+    class_counts  = train_labels_active.sum(axis=0)
+    class_weights = 1.0 / (class_counts + 1e-6)
+
+    sample_weights = (train_labels_active * class_weights).max(axis=1)
+    sample_weights = sample_weights ** SAMPLER_POWER
+
+    # "No Finding"-only images now have weight 0 here, so the clip
+    # brings them up to the minimum positive weight — they're still seen,
+    # but not over-represented relative to true disease cases
+    sample_weights = np.clip(
+        sample_weights,
+        a_min=sample_weights[sample_weights > 0].min(),
+        a_max=None,
+    )
+    sample_weights = sample_weights / sample_weights.mean()
+    
+    sampler = init_sampler(label_matrix=label_matrix, train_idx=train_idx)
+    
 
     # Loaders
     train_loader = DataLoader(
@@ -549,26 +702,28 @@ if __name__ == "__main__":
             for p in layer.parameters():
                 p.requires_grad = False
    
+
+    # Better logging
+    log_path = "training_log.csv"
+    with open(log_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "tr_loss", "tr_auc", "val_loss", "val_auc"] + ALL_CLASSES)
+
+    
+
     # scaler = GradScaler(device="cuda")
     criterion = AsymmetricLoss(
         gamma_pos=GAMMA_POS,
         gamma_neg=GAMMA_NEG,
         clip=ASYMMETRIC_CLIP,
-        label_smooth=0.05,
+        # label_smooth=LABEL_SMOOTH,
     )
 
-
+    ###
     ### Training cycle ###
-    def run_epoch(loader, train=True):
+    ###
 
-        for group in optimizer.param_groups:
-            for p in group["params"]:
-                if getattr(p, "_just_unfroze", False):
-                    state = optimizer.state.get(p)
-                    if state:
-                        state.pop("exp_avg", None)
-                        state.pop("exp_avg_sq", None)
-                    p._just_unfroze = False
+    def run_epoch(loader, train=True):
 
         model.train() if train else model.eval()
         total_loss = 0.0
@@ -583,13 +738,15 @@ if __name__ == "__main__":
                 views = views.to(device, non_blocking=True)
                 n_samples += imgs.size(0)
 
+                if train:
+                    optimizer.zero_grad()
+                
                 with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 # with autocast(device_type="cuda", dtype=torch.float16, enabled=True):
                     logits = model(imgs, views)
                     loss = criterion(logits, lbls)
 
                 if train:
-                    optimizer.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
@@ -607,6 +764,8 @@ if __name__ == "__main__":
         per_class_auc = {}
         aucs = []
         for c in range(labels.shape[1]):
+            if c == NO_FINDING_COL:
+                continue
             col = labels[:, c]
             n_pos = col.sum()
             if n_pos >= MIN_VAL_POSITIVES and n_pos < len(col):
@@ -624,7 +783,6 @@ if __name__ == "__main__":
    
     best_val = 0.0
     no_improve = 0
-    UNFROZEN_PARAMS = set()
     
     ### Training loop ###
     for epoch in range(1, NUM_EPOCHS + 1):
@@ -635,20 +793,40 @@ if __name__ == "__main__":
                     p.requires_grad = True
 
 
-                    if p not in UNFROZEN_PARAMS:
-                        optimizer.state.pop(p, None)
-                        UNFROZEN_PARAMS.add(p)
+        # Disable attention early
+        if epoch <= ATTN_WARMUP_EPOCHS:
+            model.use_attention = False
+        else:
+            model.use_attention = True
 
-
+        ### Train epoch ###
         tr_loss, tr_auc, _ = run_epoch(train_loader, train=True)
+        
+        scheduler.step()
         torch.cuda.empty_cache()
         time.sleep(HARDWARE_PITY)
+        
+        ### Value epoch ###
         val_loss, val_auc, per_class = run_epoch(val_loader, train=False)
 
         print("  Per-class AUCs:")
         for cls, auc in sorted(per_class.items(), key=lambda x: x[1]):
             print(f"    {cls:<20s} {auc:.3f}")
 
+        with open(log_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([epoch, tr_loss, tr_auc, val_loss, val_auc] +
+                            [per_class.get(c, "") for c in ALL_CLASSES])
+
+        if epoch % 5 == 0:
+            torch.save({
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "best_val": best_val,
+                "no_improve": no_improve,
+            }, f"checkpoint_epoch{epoch:02d}.pth")
         if val_auc > best_val:
             best_val = val_auc
             no_improve = 0
@@ -666,12 +844,10 @@ if __name__ == "__main__":
         layer3_lr = next(g["lr"] for g in optimizer.param_groups if g.get("layer_idx") == 3)
         print(f"  head_lr={head_lr:.2e}  layer3_lr={layer3_lr:.2e}")
 
-        for g in optimizer.param_groups:
-            print(g["layer_idx"], g["lr"])
+        # for g in optimizer.param_groups:
+        #     print(g["layer_idx"], g["lr"])
 
-        scheduler.step()
-
-        if no_improve >= PATIENCE:
+        if no_improve >= PATIENCE and epoch > max(UNFREEZE_SCHEDULE.keys()) + UNFREEZE_WARMUP_EPOCHS:
             print(f"Early stopping triggered at epoch {epoch}")
             break
 
@@ -682,4 +858,28 @@ if __name__ == "__main__":
     print("view_scale:", torch.sigmoid(model.view_scale).item() * 2.0)
     
     # Print the attn_temp to see if attention pooling sharpened
-    print("attn_temp:", model.attn_temp.item())
+    print("attn_temp:", model.attn_pool.temp.item())
+
+    model.eval()
+
+    gradcam = GradCAM(model, device)
+
+    # Grab one validation image
+    for vis_i in range(len(value_ds)):
+        img_tensor, lbl, view = value_ds[vis_i]
+        if lbl.sum() > 0 and lbl[NO_FINDING_COL] == 0:
+            img_np = cv2.imread(path_lookup[df.iloc[value_idx[vis_i]]["Image Index"]], cv2.IMREAD_GRAYSCALE)
+            break
+    else:
+        print("Warning: no suitable validation image found for visualization")
+        gradcam.remove()
+        sys.exit()
+
+
+    for class_idx in range(NUM_CLASSES):
+        if lbl[class_idx] == 1:   # only visualize positive classes for this image
+            visualize_class(model, img_tensor, img_np, class_idx,
+                            device, gradcam, view_id=int(view),
+                            save_path=f"viz_{ALL_CLASSES[class_idx]}.png")
+
+    gradcam.remove()
