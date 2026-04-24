@@ -1,5 +1,32 @@
+import cv2
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
+
+import torch
+
+from dataset import ALL_CLASSES
+from train import get_class_attention
+
+
+
+def get_class_attention(model, img_tensor, class_idx, device, view_id=0):
+    model.eval()
+    with torch.no_grad():
+        feats = model.backbone.forward_features(img_tensor.unsqueeze(0).to(device))
+        view_id = torch.tensor([view_id], dtype=torch.long, device=device)
+        v = model.view_mlp(model.view_embed(view_id))
+        gamma, beta = v.chunk(2, dim=-1)
+        scale = torch.sigmoid(model.view_scale) * 2.0
+        feats = feats * (1 + scale * gamma.unsqueeze(1)) + beta.unsqueeze(1)
+
+        normed = model.attn_pool.norm(feats)
+        attn = model.attn_pool.query(normed)                            # (1, N, num_classes)
+        attn = torch.softmax(attn / model.attn_pool.temp.clamp(min=0.1), dim=1)
+        attn_map = attn[0, :, class_idx]                                # (N,)
+
+    H = W = int(attn_map.shape[0] ** 0.5)
+    return attn_map.reshape(H, W).cpu().numpy()
+
 
 class GradCAM:
     """

@@ -71,8 +71,8 @@ MODEL_OUTPUT_FILE = "swin_cxr8_best.pth"
 
 ### Tuning Parameters ###
 # Training Control
-NUM_EPOCHS = 55
-PATIENCE = 16
+NUM_EPOCHS = 65
+PATIENCE = 22
 
 # Loss Parameters
 GAMMA_POS  = 0.2
@@ -81,7 +81,7 @@ ASYMMETRIC_CLIP = 0.05
 # LABEL_SMOOTH = 0.0
 
 # Wait for backbone to unfreeze
-ATTN_WARMUP_EPOCHS = 24
+ATTN_WARMUP_EPOCHS = 23
 
 # BASE_LR = 5e-5
 BASE_LR = 7e-5
@@ -140,23 +140,6 @@ NUM_CLASSES = len(ALL_CLASSES)
 # Check point file labels that aren't required
 EXPECTED_MISSING = {"relative_coords_table", "relative_position_index", "attn_mask"}
 
-def get_class_attention(model, img_tensor, class_idx, device, view_id=0):
-    model.eval()
-    with torch.no_grad():
-        feats = model.backbone.forward_features(img_tensor.unsqueeze(0).to(device))
-        view_id = torch.tensor([view_id], dtype=torch.long, device=device)
-        v = model.view_mlp(model.view_embed(view_id))
-        gamma, beta = v.chunk(2, dim=-1)
-        scale = torch.sigmoid(model.view_scale) * 2.0
-        feats = feats * (1 + scale * gamma.unsqueeze(1)) + beta.unsqueeze(1)
-
-        normed = model.attn_pool.norm(feats)
-        attn = model.attn_pool.query(normed)                            # (1, N, num_classes)
-        attn = torch.softmax(attn / model.attn_pool.temp.clamp(min=0.1), dim=1)
-        attn_map = attn[0, :, class_idx]                                # (N,)
-
-    H = W = int(attn_map.shape[0] ** 0.5)
-    return attn_map.reshape(H, W).cpu().numpy()
 
 # Logging and tuning purposes
 def print_train_parameters():
@@ -518,7 +501,7 @@ def init_param_groups(model, base_lr=1e-4, decay=0.8, schedule=None):
     groups = []
     seen = set()
 
-    def add(params, lr, layer_idx, weight_decay=1e-2):
+    def add(params, lr, layer_idx, weight_decay=1e-2, unfreeze_override=None):
         wd, no_wd = [], []
         for p in params:
             pid = id(p)
@@ -526,13 +509,13 @@ def init_param_groups(model, base_lr=1e-4, decay=0.8, schedule=None):
             seen.add(pid)
             (wd if p.ndim > 1 else no_wd).append(p)
 
-        ue = layer_unfreeze_epoch(layer_idx, schedule)
+        ue = unfreeze_override if unfreeze_override is not None else layer_unfreeze_epoch(layer_idx, schedule)
         for bucket, wdv in [(wd, weight_decay), (no_wd, 0.0)]:
             if bucket:
                 groups.append({
                     "params": bucket,
                     "lr": lr,
-                    "base_lr": lr, # stored for lambda scaling
+                    "base_lr": lr,
                     "layer_idx": layer_idx,
                     "unfreeze_epoch": ue,
                     "weight_decay": wdv,
@@ -546,7 +529,8 @@ def init_param_groups(model, base_lr=1e-4, decay=0.8, schedule=None):
     add(model.head.parameters(),       base_lr * HEAD_LR_MULTIPLIER, -1)
     add(model.view_embed.parameters(), base_lr, -1)
     add(model.view_mlp.parameters(),   base_lr, -1)
-    add(model.attn_pool.parameters(), base_lr * 2, -1)
+    add(model.attn_pool.parameters(), base_lr * 2, -1,
+        unfreeze_override=ATTN_WARMUP_EPOCHS)
     add([model.view_scale], base_lr, -1)
 
     leftovers = [p for p in model.parameters() if id(p) not in seen]
@@ -845,7 +829,7 @@ if __name__ == "__main__":
         # for g in optimizer.param_groups:
         #     print(g["layer_idx"], g["lr"])
 
-        if no_improve >= PATIENCE and epoch > max(UNFREEZE_SCHEDULE.keys()) + UNFREEZE_WARMUP_EPOCHS:
+        if no_improve >= PATIENCE and epoch > max(UNFREEZE_SCHEDULE.keys()) + ATTN_WARMUP_EPOCHS:
             print(f"Early stopping triggered at epoch {epoch}")
             break
 
