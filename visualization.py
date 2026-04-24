@@ -1,11 +1,11 @@
 import cv2
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
+
 
 import torch
+import numpy as np
 
 from dataset import ALL_CLASSES
-from train import get_class_attention
 
 
 
