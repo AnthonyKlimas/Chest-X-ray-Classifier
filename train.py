@@ -31,6 +31,7 @@ import pandas as pd
 import torch.nn as nn
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from skmultilearn.model_selection import IterativeStratification
 from sklearn.preprocessing import MultiLabelBinarizer
 from torch.amp import autocast
@@ -80,11 +81,9 @@ GAMMA_NEG  = 2.0
 ASYMMETRIC_CLIP = 0.05
 # LABEL_SMOOTH = 0.0
 
-# Wait for backbone to unfreeze
-ATTN_WARMUP_EPOCHS = 23
 
 # BASE_LR = 5e-5
-BASE_LR = 7e-5
+BASE_LR = 1e-4
 # No pretraining for head
 # Multiply the BASE_LR to compensate
 HEAD_LR_MULTIPLIER = 5
@@ -93,25 +92,33 @@ LR_LAYER_DECAY = 0.8
 WEIGHT_DECAY = 1e-2
 
 # Sample extra from low appearing catagories
-SAMPLER_POWER = 0.19
+# Keep low to not fight ASL
+SAMPLER_POWER = 0.05
 
 
 VIEW_POSITION_SCALE = 0.35
 
-FEATURE_DROPOUT    = 0.2
-CLASSIFIER_DROPOUT = 0.1
+FEATURE_DROPOUT    = 0.05
+CLASSIFIER_DROPOUT = 0.04
+
+# Wait for backbone to unfreeze
+ETA_RATIO = 0.15
+ATTN_WARMUP_EPOCHS = 6
+ATTN_POOL_UNFREEZE_EPOCH = 4
+
 
 # Unfreeze the backbone stages slowly
 UNFREEZE_SCHEDULE = {
-     3: 0,
-     7: 1,
-    12: 2,
-    18: 3,
+    2: 0,
+    4: 1,
+    7: 2,
+    11: 3,
 }
-
 
 UNFREEZE_WARMUP_EPOCHS = 2
 UNFREEZE_WARMUP_FACTOR = 0.1
+
+EMA_DECAY = 0.9988
 
 # seconds to sleep after training
 # set to 0 if not concerned about hardware overheating
@@ -159,11 +166,14 @@ def print_train_parameters():
     print("GAMMA_POS", GAMMA_POS)
     # print("LABEL_SMOOTH",LABEL_SMOOTH)
     print("ATTN_WARMUP_EPOCHS", ATTN_WARMUP_EPOCHS)
+    print("ATTN_POOL_UNFREEZE_EPOCH", ATTN_POOL_UNFREEZE_EPOCH)
     print("UNFREEZE_WARMUP_EPOCHS", UNFREEZE_WARMUP_EPOCHS)
     print("UNFREEZE_WARMUP_FACTOR",UNFREEZE_WARMUP_FACTOR)
     print("WEIGHT_DECAY", WEIGHT_DECAY)
     print("FEATURE_DROPOUT", FEATURE_DROPOUT)
     print("CLASSIFIER_DROPOUT", CLASSIFIER_DROPOUT)
+    print("EMA_DECAY", EMA_DECAY)
+    print("ETA_RATIO", ETA_RATIO)
     print("BATCH_SIZE_VAL", BATCH_SIZE_VAL)
     print("BATCH_SIZE_TRAIN", BATCH_SIZE_TRAIN)
     print("HARDWARE_PITY", HARDWARE_PITY)
@@ -172,6 +182,7 @@ def print_train_parameters():
     print("VALUE_LOADER_WORKERS", LOADER_WORKERS_VALUE)
     print("PREFETECH_FACTOR", PREFETECH_FACTOR)
     print("PERSISTENT_WORKERS", PERSISTENT_WORKERS)
+    print("MIN_VAL_POSITIVES", MIN_VAL_POSITIVES)
     print(datetime.datetime.now())
 
 
@@ -296,7 +307,6 @@ def layer_unfreeze_epoch(layer_idx, schedule):
     return 1
 
 def make_lr_lambda(unfreeze_epoch, base_lr):
-    eta_ratio = 0.0  # allow full decay to 0
     cosine_span = max(NUM_EPOCHS - unfreeze_epoch - UNFREEZE_WARMUP_EPOCHS, 1)
 
     def lr_lambda(epoch):
@@ -308,7 +318,7 @@ def make_lr_lambda(unfreeze_epoch, base_lr):
             return UNFREEZE_WARMUP_FACTOR + (1 - UNFREEZE_WARMUP_FACTOR) * warmup_frac
         cosine_e = e - unfreeze_epoch - UNFREEZE_WARMUP_EPOCHS
         cos = 0.5 * (1 + math.cos(math.pi * cosine_e / cosine_span))
-        return eta_ratio + (1 - eta_ratio) * cos
+        return ETA_RATIO + (1 - ETA_RATIO) * cos
 
     return lr_lambda
 
@@ -450,10 +460,16 @@ class SwinWithView(nn.Module):
             nn.GELU(),
             nn.Linear(128, C * 2)
         )
+        nn.init.normal_(self.view_mlp[-1].weight, std=1e-3)
+        nn.init.zeros_(self.view_mlp[-1].bias)    
         self.view_scale = nn.Parameter(torch.tensor(VIEW_POSITION_SCALE))
-
-        nn.init.zeros_(self.view_mlp[-1].weight)
-        nn.init.zeros_(self.view_mlp[-1].bias)
+        
+        self.shared = nn.Sequential(
+            nn.Linear(C, C),
+            nn.GELU()
+        )
+        nn.init.xavier_uniform_(self.shared[1].weight)
+        nn.init.zeros_(self.shared[1].bias)
 
         # Per-class head: each class gets its own (C -> 1) projection
         # implemented efficiently as a single Linear(C, num_classes)
@@ -462,10 +478,10 @@ class SwinWithView(nn.Module):
         self.head = nn.Sequential(
             nn.LayerNorm(C),
             nn.Dropout(FEATURE_DROPOUT),
-            nn.Linear(C, 512),
+            nn.Linear(C, 256),
             nn.GELU(),
             nn.Dropout(CLASSIFIER_DROPOUT),
-            nn.Linear(512, 1),   # applied per class independently
+            nn.Linear(256, 1),   # applied per class independently
         )
 
     def forward(self, x, view_id):
@@ -490,8 +506,12 @@ class SwinWithView(nn.Module):
         # Reshape to (B * num_classes, C), run head, reshape back
         B, K, C = pooled.shape
         pooled_flat = pooled.reshape(B * K, C)
-        logits = self.head(pooled_flat).squeeze(-1)  # (B * num_classes)
-        logits = logits.reshape(B, K)                # (B, num_classes)
+
+        pooled_flat = self.shared(pooled_flat)   # ← INSERT HERE
+
+        logits = self.head(pooled_flat).squeeze(-1)
+        logits = logits.reshape(B, K)
+        
 
         return logits
 
@@ -529,8 +549,9 @@ def init_param_groups(model, base_lr=1e-4, decay=0.8, schedule=None):
     add(model.head.parameters(),       base_lr * HEAD_LR_MULTIPLIER, -1)
     add(model.view_embed.parameters(), base_lr, -1)
     add(model.view_mlp.parameters(),   base_lr, -1)
-    add(model.attn_pool.parameters(), base_lr * 2, -1,
-        unfreeze_override=ATTN_WARMUP_EPOCHS)
+    add(model.attn_pool.parameters(), base_lr * 1.0, -1,
+        unfreeze_override=ATTN_POOL_UNFREEZE_EPOCH)
+    add(model.shared.parameters(), base_lr * HEAD_LR_MULTIPLIER, -1)
     add([model.view_scale], base_lr, -1)
 
     leftovers = [p for p in model.parameters() if id(p) not in seen]
@@ -606,8 +627,10 @@ if __name__ == "__main__":
     )
     sample_weights = sample_weights / sample_weights.mean()
     
-    sampler = init_sampler(label_matrix=label_matrix, train_idx=train_idx)
-    
+    # sampler = init_sampler(label_matrix=label_matrix, train_idx=train_idx)
+    sampler = None
+    shuffle = True
+    print("Note: Sampler = None")
 
     # Loaders
     train_loader = DataLoader(
@@ -618,13 +641,13 @@ if __name__ == "__main__":
         worker_init_fn=worker_init_fn,
         persistent_workers=PERSISTENT_WORKERS,
         pin_memory=True,
+        shuffle=True,
         prefetch_factor=PREFETECH_FACTOR,
     )
 
     val_loader = DataLoader(
         value_ds,
         batch_size=BATCH_SIZE_VAL,
-        shuffle=False,
         num_workers=LOADER_WORKERS_VALUE,
         worker_init_fn=worker_init_fn,
         persistent_workers=PERSISTENT_WORKERS,
@@ -667,6 +690,8 @@ if __name__ == "__main__":
 
     # Model Training Checkpoint
     init_ckpt(model=model, path=SSL_CKPT)
+
+    ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(decay=EMA_DECAY))
                 
     param_group = init_param_groups(model, base_lr=BASE_LR,
                                     decay=LR_LAYER_DECAY, schedule=UNFREEZE_SCHEDULE)
@@ -705,9 +730,10 @@ if __name__ == "__main__":
     ### Training cycle ###
     ###
 
-    def run_epoch(loader, train=True):
+    def run_epoch(loader, train=True, eval_model=None):
+        active_model = eval_model if (not train and eval_model) else model
+        active_model.train() if train else active_model.eval()
 
-        model.train() if train else model.eval()
         total_loss = 0.0
         n_samples = 0
         all_logits, all_labels = [], []
@@ -725,13 +751,14 @@ if __name__ == "__main__":
                 
                 with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 # with autocast(device_type="cuda", dtype=torch.float16, enabled=True):
-                    logits = model(imgs, views)
+                    logits = active_model(imgs, views)
                     loss = criterion(logits, lbls)
 
                 if train:
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
+                    ema_model.update_parameters(model)
 
                 total_loss += loss.item() * imgs.size(0)
                 all_logits.append(logits.sigmoid().float().cpu().detach())
@@ -783,13 +810,14 @@ if __name__ == "__main__":
 
         ### Train epoch ###
         tr_loss, tr_auc, _ = run_epoch(train_loader, train=True)
-        
+                
         scheduler.step()
         torch.cuda.empty_cache()
         time.sleep(HARDWARE_PITY)
         
         ### Value epoch ###
-        val_loss, val_auc, per_class = run_epoch(val_loader, train=False)
+        val_loss, val_auc, per_class = run_epoch(val_loader, train=False, eval_model=ema_model)
+
 
         print("  Per-class AUCs:")
         for cls, auc in sorted(per_class.items(), key=lambda x: x[1]):
@@ -812,7 +840,7 @@ if __name__ == "__main__":
         if val_auc > best_val:
             best_val = val_auc
             no_improve = 0
-            torch.save(model.state_dict(), MODEL_OUTPUT_FILE)
+            torch.save(ema_model.module.state_dict(), MODEL_OUTPUT_FILE)
             print("  ->  saved")
         else:
             no_improve += 1
