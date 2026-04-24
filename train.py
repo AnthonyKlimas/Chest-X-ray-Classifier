@@ -71,16 +71,17 @@ MODEL_OUTPUT_FILE = "swin_cxr8_best.pth"
 
 ### Tuning Parameters ###
 # Training Control
-NUM_EPOCHS = 48
-PATIENCE = 14
+NUM_EPOCHS = 55
+PATIENCE = 16
 
 # Loss Parameters
-GAMMA_POS  = 1.0
+GAMMA_POS  = 0.2
 GAMMA_NEG  = 2.0
 ASYMMETRIC_CLIP = 0.05
 # LABEL_SMOOTH = 0.0
 
-ATTN_WARMUP_EPOCHS = 1
+# Wait for backbone to unfreeze
+ATTN_WARMUP_EPOCHS = 24
 
 # BASE_LR = 5e-5
 BASE_LR = 7e-5
@@ -108,16 +109,8 @@ UNFREEZE_SCHEDULE = {
     18: 3,
 }
 
-# considering a schedule like this:
-# UNFREEZE_SCHEDULE = {
-#     2: 0,
-#     5: 1,
-#     9: 2,
-#     14: 3,
-# }
 
-
-UNFREEZE_WARMUP_EPOCHS = 5
+UNFREEZE_WARMUP_EPOCHS = 2
 UNFREEZE_WARMUP_FACTOR = 0.1
 
 # seconds to sleep after training
@@ -481,16 +474,16 @@ class SwinWithView(nn.Module):
 
         # Per-class head: each class gets its own (C -> 1) projection
         # implemented efficiently as a single Linear(C, num_classes)
-        self.head = nn.Linear(C, num_classes)
+        # self.head = nn.Linear(C, num_classes)
 
-        # self.head = nn.Sequential(
-        #     nn.LayerNorm(C),
-        #     nn.Dropout(FEATURE_DROPOUT),
-        #     nn.Linear(C, 512),
-        #     nn.GELU(),
-        #     nn.Dropout(CLASSIFIER_DROPOUT),
-        #     nn.Linear(512, 1),   # applied per class independently
-        # )
+        self.head = nn.Sequential(
+            nn.LayerNorm(C),
+            nn.Dropout(FEATURE_DROPOUT),
+            nn.Linear(C, 512),
+            nn.GELU(),
+            nn.Dropout(CLASSIFIER_DROPOUT),
+            nn.Linear(512, 1),   # applied per class independently
+        )
 
     def forward(self, x, view_id):
         feats = self.backbone.forward_features(x)   # (B, N, C)
@@ -722,7 +715,7 @@ if __name__ == "__main__":
         gamma_neg=GAMMA_NEG,
         clip=ASYMMETRIC_CLIP,
         # label_smooth=LABEL_SMOOTH,
-    )
+    ).to(device)
 
     ###
     ### Training cycle ###
