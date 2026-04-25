@@ -37,7 +37,7 @@ from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 
-from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
+from sklearn.model_selection import StratifiedShuffleSplit
 
 
 
@@ -250,18 +250,22 @@ class UnfreezeScheduler:
 def init_split(df, label_matrix):
     patient_ids = df["Patient ID"].unique()
 
-    # For each patient, OR together all their image labels
     patient_label_matrix = np.zeros((len(patient_ids), len(ALL_CLASSES)), dtype=int)
     patient_id_to_idx = {pid: i for i, pid in enumerate(patient_ids)}
     for img_idx, row in df.iterrows():
         p = patient_id_to_idx[row["Patient ID"]]
         patient_label_matrix[p] |= label_matrix[img_idx]
 
-    # Stratified split at patient level
-    # Use patient who have been diagnosed later with hernia,
-    # but have previous undiagnosed images
-    msss = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=0.15, random_state=42)
-    train_patient_idx, val_patient_idx = next(msss.split(patient_ids, patient_label_matrix))
+    # Collapse multilabel to a single stratification key via label combination hash
+    # Rare combos get lumped into a single "other" bin to avoid singleton strata
+    combo_strings = ["_".join(map(str, row)) for row in patient_label_matrix]
+    from collections import Counter
+    counts = Counter(combo_strings)
+    MIN_COMBO_COUNT = 2
+    strat_labels = [c if counts[c] >= MIN_COMBO_COUNT else "__other__" for c in combo_strings]
+
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=0.15, random_state=42)
+    train_patient_idx, val_patient_idx = next(sss.split(patient_ids, strat_labels))
 
     train_patients = set(patient_ids[train_patient_idx])
     value_patients = set(patient_ids[val_patient_idx])
@@ -269,11 +273,10 @@ def init_split(df, label_matrix):
     train_idx = df[df["Patient ID"].isin(train_patients)].index.to_numpy()
     value_idx = df[df["Patient ID"].isin(value_patients)].index.to_numpy()
 
-    # Verify Hernia representation improved
     for split_name, idx in [("train", train_idx), ("val", value_idx)]:
         n_hernia = label_matrix[idx, ALL_CLASSES.index("Hernia")].sum()
         print(f"{split_name} Hernia positives: {n_hernia}")
-    
+
     return train_idx, value_idx
 
 # Loads the SSL checkpoint from the path SSL_CKPT
@@ -588,13 +591,12 @@ if __name__ == "__main__":
         label_smooth=0.05,
     )
 
-    # Slow head learning initally
-    # warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-    #     optimizer,
-    #     start_factor=WARMUP_START_FACTOR,
-    #     end_factor=WARMUP_END_FACTOR,
-    #     total_iters=WARMUP_EPOCHS
-    # )
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=WARMUP_START_FACTOR,
+        end_factor=WARMUP_END_FACTOR,
+        total_iters=WARMUP_EPOCHS
+    )
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=NUM_EPOCHS - WARMUP_EPOCHS,
