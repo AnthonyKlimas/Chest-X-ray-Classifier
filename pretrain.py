@@ -1,226 +1,423 @@
+"""
+SimMIM Self-Supervised Pretraining for SwinV2 on Chest X-rays
 
-import os
+Fixes vs original simmim.py:
+  1. Learned mask token instead of zero-fill
+  2. Per-patch normalized reconstruction targets
+  3. FPN decoder with skip connections from all 4 backbone stages
+  4. Checkpoint format compatible with train.py init_ckpt
+  5. Full resumable checkpoints (model + optimizer + scaler + epoch)
+  6. use_checkpoint=False (48 GB VRAM — no need for activation checkpointing)
+
+CXR-specific improvements:
+  - CLAHE + per-image standardization matches supervised train.py preprocessing
+  - No vertical flip, no color jitter (anatomically wrong / grayscale)
+  - Mild random rotation + horizontal flip only
+
+Multi-GPU:
+  torchrun --nproc_per_node=8 pretrain.py
+Single-GPU:
+  python pretrain.py
+"""
+
+import datetime
 import glob
 import math
-from pathlib import Path
+import os
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
 from PIL import Image
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torchvision import transforms
 from tqdm import tqdm
 
+from dataset import CLIP_LIMIT, TILE_GRID_SIZE, CLAHETransform, PerImageStandardize
 from swin_transformer_v2 import SwinTransformerV2
 
 
-### Path Configuration ###
-IMAGE_ROOT = "../chest_xray_dataset/CXR8/images_preprocessed"
+# Paths
+IMAGE_ROOT  = "../chest_xray_dataset/CXR8/images_preprocessed"
 OUTPUT_CKPT = "../chest_xray_dataset/simmim_swinv2_cxr_backbone.pth"
+RESUME_CKPT = None   # set to a full checkpoint path to resume training
+
+# Architecture (must match train.py)
+IMG_SIZE    = 384
+PATCH_SIZE  = 4
+IN_CHANS    = 3
+EMBED_DIM   = 96
+DEPTHS      = [2, 2, 18, 2]
+NUM_HEADS   = [3, 6, 12, 24]
+WINDOW_SIZE = 8
+
+# Pretraining
+MASK_RATIO   = 0.60
+DECODER_DIM  = 256   # internal channel width of FPN decoder
+
+# Per GPU.  8 GPUs × 32 = effective batch 256.
+BATCH_SIZE   = 32
+ACCUM_STEPS  = 8     # increase to further multiply effective batch
+
+# Square-root scaling from reference (1e-4 @ bs=32 → 2e-4 @ bs=256)
+BASE_LR        = 2e-4
+WEIGHT_DECAY   = 0.05
+WARMUP_EPOCHS  = 10
+NUM_EPOCHS     = 100
+NUM_WORKERS    = 10
+PRINT_FREQ     = 100
+SAVE_EVERY     = 10   # full checkpoint cadence (epochs)
 
 
-### SimMIM Parameters ###
-IMG_SIZE = 256
-PATCH_SIZE = 4
-IN_CHANS = 3
+# Dataset
+class CXRPretrainDataset(Dataset):
+    """
+    Unlabeled CXR dataset for SimMIM pretraining.
 
-BATCH_SIZE = 8
-ACCUM_STEPS = 4
-NUM_EPOCHS = 50
-MASK_RATIO = 0.6
-
-BASE_LR = 1e-4
-WEIGHT_DECAY = 0.05
-WARMUP_EPOCHS = 5
-NUM_WORKERS = 10
-PRINT_FREQ = 180
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-# Unlabeled CXR dataset
-class UnlabeledCXRDataset(Dataset):
-    def __init__(self, root, img_size=256):
+    Uses the same CLAHE + per-image standardization pipeline as the supervised
+    train.py so that pretrained features transfer without a distribution shift.
+    Augmentations are conservative and anatomically appropriate for chest X-rays:
+      - Horizontal flip only  (left-right symmetry is valid for CXRs)
+      - Small rotation        (±10°)
+      - No vertical flip      (anatomically wrong)
+      - No color jitter       (images are converted to grayscale→RGB)
+    """
+    def __init__(self, root: str, img_size: int = 256):
         self.paths = sorted(
             glob.glob(os.path.join(root, "**", "*.png"), recursive=True)
             + glob.glob(os.path.join(root, "**", "*.jpg"), recursive=True)
-            + glob.glob(os.path.join(root, "**", "*.jpeg"), recursive=True)
         )
-        if len(self.paths) == 0:
+        if not self.paths:
             raise RuntimeError(f"No images found under {root}")
 
         self.tf = transforms.Compose([
             transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),  # [0,1]
+            CLAHETransform(clip_limit=CLIP_LIMIT, tile_grid_size=TILE_GRID_SIZE),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomApply([transforms.RandomRotation(degrees=10)], p=0.5),
+            transforms.ToTensor(),
+            PerImageStandardize(),
         ])
 
     def __len__(self):
         return len(self.paths)
 
-    def __getitem__(self, idx):
-        p = self.paths[idx]
-        img = Image.open(p).convert("RGB")
-        img = self.tf(img)
-        return img
+    def __getitem__(self, idx: int):
+        img = Image.open(self.paths[idx]).convert("RGB")
+        return self.tf(img)
 
 
-# SimMIM for SwinV2 (correct)
+# FPN Decoder
+class FPNDecoder(nn.Module):
+    """
+    Lightweight FPN that fuses all 4 backbone stage outputs and progressively
+    upsamples to the patch grid (64×64 for 256px input / patch_size=4).
+
+    Stage output spatial sizes (SwinV2-Small, 256px, patch_size=4):
+        stage[0]:  32×32   C=192
+        stage[1]:  16×16   C=384
+        stage[2]:   8×8    C=768
+        stage[3]:   8×8    C=768  ← deepest; norm applied in _encode
+
+    Decoder path:
+        8×8   fuse stage[2] + stage[3]
+        16×16  upsample 2× + fuse stage[1]
+        32×32  upsample 2× + fuse stage[0]
+        64×64  upsample 2× + refine
+        head → (in_chans × patch_size², 64, 64)
+
+    Each lateral branch has its own LayerNorm so intermediate encoder features
+    (which lack a backbone norm) are normalized before projection.
+    """
+
+    def __init__(
+        self,
+        encoder_dims: list,
+        decoder_dim: int,
+        out_channels: int,
+        stage_hw: list,
+    ):
+        super().__init__()
+        self.stage_hw = stage_hw   # [(32,32),(16,16),(8,8),(8,8)]
+
+        # Lateral: token-space LayerNorm + linear projection to decoder_dim
+        self.lat = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(enc_dim),
+                nn.Linear(enc_dim, decoder_dim),
+            )
+            for enc_dim in encoder_dims
+        ])
+
+        def fuse(in_c: int, out_c: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Conv2d(in_c, out_c, 3, padding=1, bias=False),
+                nn.BatchNorm2d(out_c),
+                nn.GELU(),
+            )
+
+        D = decoder_dim
+        self.fuse_8  = fuse(D * 2, D)   # merge stage[2] and stage[3]
+        self.fuse_16 = fuse(D * 2, D)   # merged + stage[1] skip
+        self.fuse_32 = fuse(D * 2, D)   # merged + stage[0] skip
+        self.fuse_64 = fuse(D,     D)   # final refinement before head
+
+        self.head = nn.Conv2d(D, out_channels, kernel_size=1)
+
+    @staticmethod
+    def _to_feat(tokens: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        """(B, h*w, C) → (B, C, h, w)"""
+        B, _, C = tokens.shape
+        return tokens.transpose(1, 2).reshape(B, C, h, w)
+
+    def forward(self, stage_feats: list) -> torch.Tensor:
+        # Project each stage to decoder_dim, reshape to spatial feature maps
+        fmaps = [
+            self._to_feat(self.lat[i](stage_feats[i]), *self.stage_hw[i])
+            for i in range(4)
+        ]
+
+        up = lambda t: F.interpolate(t, scale_factor=2, mode="bilinear", align_corners=False)
+
+        x = self.fuse_8(torch.cat([fmaps[2], fmaps[3]], dim=1))   # 8×8
+        x = self.fuse_16(torch.cat([up(x),   fmaps[1]], dim=1))   # 16×16
+        x = self.fuse_32(torch.cat([up(x),   fmaps[0]], dim=1))   # 32×32
+        x = self.fuse_64(up(x))                                    # 64×64
+        return self.head(x)                                        # (B, P, 64, 64)
+
+
+# SimMIM model
 class SimMIM_SwinV2(nn.Module):
     """
-    SimMIM-style pretraining for hierarchical SwinV2:
-      - mask at patch level (64x64 = 4096 patches)
-      - encode with full Swin
-      - upsample encoder tokens back to patch grid
-      - reconstruct pixel patches at masked positions
+    SimMIM pretraining wrapper around SwinTransformerV2.
+
+    Key design choices
+    
+    Mask token
+        A shared learned parameter replaces masked patch embeddings (SimMIM 3.1).
+        Zero-fill (original bug) encodes position information through the specific
+        value 0.0 in embedding space, undermining masked modelling.
+
+    Reconstruction target
+        Per-patch L1 loss on *normalized* pixel patches (mean=0, std=1 per patch).
+        Normalization removes global CXR intensity variation and focuses the
+        objective on local texture — the signal most useful for pathology detection.
+
+    Decoder
+        FPN with skip connections from all 4 encoder stages.  The original bilinear
+        8×→64× upsample discards three quarters of the spatial hierarchy.
     """
-    def __init__(self, backbone: SwinTransformerV2,
-                 img_size=256, patch_size=4, in_chans=3, mask_ratio=0.6):
+
+    def __init__(
+        self,
+        backbone: SwinTransformerV2,
+        img_size: int   = 256,
+        patch_size: int = 4,
+        in_chans: int   = 3,
+        mask_ratio: float = 0.6,
+        decoder_dim: int  = 256,
+    ):
         super().__init__()
-        self.backbone = backbone
+        self.backbone   = backbone
         self.mask_ratio = mask_ratio
-
-        self.img_size = img_size
         self.patch_size = patch_size
-        self.in_chans = in_chans
 
-        # Patch grid
-        self.num_patches_h = img_size // patch_size
-        self.num_patches_w = img_size // patch_size
-        self.num_patches = self.num_patches_h * self.num_patches_w  # 64*64=4096
+        H0, W0 = backbone.patches_resolution          # 64, 64
+        self.patch_h     = H0
+        self.patch_w     = W0
+        self.num_patches = H0 * W0                    # 4096
 
-        # Final encoder dim (SwinV2-Small: 768)
-        self.encoder_dim = backbone.num_features
+        # Learned mask token
+        C0 = backbone.embed_dim                       # 96
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, C0))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
 
-        # Decoder: upsample from final feature map back to patch grid
-        # Final tokens are 8x8 (for 256/4/2/2/2), we upsample to 64x64
-        self.decoder = nn.Sequential(
-            nn.Conv2d(self.encoder_dim, self.encoder_dim, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(self.encoder_dim, in_chans * patch_size * patch_size, kernel_size=1),
+        # Derive per-stage output shapes from backbone
+        # PatchMerging fires at the END of each layer except the last,
+        # halving H and W and doubling C.
+        enc_dims, stage_hw = [], []
+        H, W = H0, W0
+        for i, layer in enumerate(backbone.layers):
+            has_down = (layer.downsample is not None)
+            if has_down:
+                H, W = H // 2, W // 2
+            stage_hw.append((H, W))
+            # Output channel dim = embed_dim * 2^min(i+1, num_layers-1)
+            enc_dims.append(
+                backbone.embed_dim
+                * (2 ** min(i + 1, backbone.num_layers - 1))
+            )
+        # stage_hw  = [(32,32), (16,16), (8,8), (8,8)]
+        # enc_dims  = [192,     384,     768,   768  ]
+
+        # FPN decoder
+        self.decoder = FPNDecoder(
+            encoder_dims=enc_dims,
+            decoder_dim=decoder_dim,
+            out_channels=in_chans * patch_size * patch_size,
+            stage_hw=stage_hw,
         )
 
-    def _random_mask(self, B, L, device):
-        """
-        Generate a random boolean mask of shape (B, L) with mask_ratio.
-        True = masked, False = visible.
-        """
-        num_mask = int(L * self.mask_ratio)
-        mask = torch.zeros(B, L, dtype=torch.bool, device=device)
-        for i in range(B):
-            idx = torch.randperm(L, device=device)[:num_mask]
-            mask[i, idx] = True
+    # Masking
+    def _random_mask(self, B: int, L: int, device) -> torch.Tensor:
+        """Vectorized random mask: True = masked.  Exactly round(L*ratio) per row."""
+        num_mask = int(round(L * self.mask_ratio))
+        ids      = torch.argsort(torch.rand(B, L, device=device), dim=1)
+        mask     = torch.zeros(B, L, dtype=torch.bool, device=device)
+        mask.scatter_(1, ids[:, :num_mask], True)
         return mask
 
-    def forward(self, imgs):
-        """
-        imgs: (B, 3, H, W)
-        Returns: scalar loss
-        """
+    # Encoder (manual forward to capture stage outputs)
+    def _encode(self, imgs: torch.Tensor, mask: torch.Tensor) -> list:
+        x = self.backbone.patch_embed(imgs)           # (B, L, C0)
+        B, L, C0 = x.shape
+
+        # Replace masked positions with the learned mask token
+        mt = self.mask_token.expand(B, L, -1)
+        x  = torch.where(mask.unsqueeze(-1), mt, x)
+
+        if self.backbone.ape:
+            x = x + self.backbone.absolute_pos_embed
+        x = self.backbone.pos_drop(x)
+
+        # Run each stage and collect output tokens
+        # backbone.norm is NOT applied here; the decoder's lateral LayerNorms
+        # handle normalization uniformly across all stages.
+        stage_feats = []
+        for layer in self.backbone.layers:
+            x = layer(x)
+            stage_feats.append(x)
+
+        return stage_feats
+
+    # Forward
+    def forward(self, imgs: torch.Tensor) -> torch.Tensor:
         B = imgs.size(0)
         device = imgs.device
 
-        # Patchify (before Swin layers)
-        x = self.backbone.patch_embed(imgs)  # (B, L, C0)
-        B_, L, C0 = x.shape
-        assert L == self.num_patches, f"Expected {self.num_patches} patches, got {L}"
+        # Random binary patch mask
+        mask = self._random_mask(B, self.num_patches, device)   # (B, L)
 
-        # Create mask at patch level
-        mask = self._random_mask(B, L, device=device)  # (B, L)
-        x_masked = x.clone()
-        x_masked[mask] = 0.0
+        # Masked encoding — collect all stage feature maps
+        stage_feats = self._encode(imgs, mask)
 
-        # Run Swin encoder manually (no avgpool)
-        if self.backbone.ape:
-            x_masked = x_masked + self.backbone.absolute_pos_embed
-        x_masked = self.backbone.pos_drop(x_masked)
+        # FPN decode → predicted pixel content
+        pred_map = self.decoder(stage_feats)                    # (B, P, 64, 64)
+        pred     = pred_map.flatten(2).transpose(1, 2)          # (B, L, P)
 
-        for layer in self.backbone.layers:
-            x_masked = layer(x_masked)
-
-        x_masked = self.backbone.norm(x_masked)  # (B, L_enc, C_enc)
-
-        # For SwinV2-Small with 256x256 and patch_size=4:
-        # L_enc = 4*4 = 16 tokens (final stage), but we know spatial shape:
-        # patches_resolution = [64, 64]
-        # final stage resolution = 64 / 8 = 8, so 8x8=64 tokens.
-        # However, SwinV2 here uses 4 stages with PatchMerging, so:
-        # 64x64 -> 32x32 -> 16x16 -> 8x8 -> 4x4 (depends on depths).
-        # Let's compute it from backbone.patches_resolution and num_layers.
-
-        H0, W0 = self.backbone.patches_resolution  # e.g. [64, 64]
-        # After num_layers-1 PatchMerging operations:
-        H_enc = H0 // (2 ** (self.backbone.num_layers - 1))
-        W_enc = W0 // (2 ** (self.backbone.num_layers - 1))
-        # So L_enc should be H_enc * W_enc
-        assert x_masked.shape[1] == H_enc * W_enc, \
-            f"Encoder tokens {x_masked.shape[1]} != {H_enc*W_enc}"
-
-        # Reshape encoder tokens to feature map
-        x_feat = x_masked.transpose(1, 2).contiguous()  # (B, C_enc, L_enc)
-        x_feat = x_feat.view(B, self.encoder_dim, H_enc, W_enc)  # (B, C_enc, H_enc, W_enc)
-
-        # Upsample to patch grid resolution (64x64)
-        x_up = F.interpolate(
-            x_feat,
-            size=(self.num_patches_h, self.num_patches_w),
-            mode="bilinear",
-            align_corners=False,
-        )  # (B, C_enc, 64, 64)
-
-        # Predict pixel patches
-        pred_map = self.decoder(x_up)  # (B, P, 64, 64), P = in_chans * patch_size^2
-
-        # Convert pred_map to (B, L, P)
-        pred = pred_map.flatten(2).transpose(1, 2)  # (B, L, P)
-
-        # Build pixel patch targets from original images
-        patches = F.unfold(
+        # Pixel-patch targets via unfold
+        targets = F.unfold(
             imgs,
             kernel_size=self.patch_size,
-            stride=self.patch_size
-        )  # (B, P, L)
-        patches = patches.transpose(1, 2)  # (B, L, P)
+            stride=self.patch_size,
+        ).transpose(1, 2)                                       # (B, L, P)
 
-        # Compute loss only on masked patches
-        # mask: (B, L) boolean
-        pred_masked = pred[mask].view(-1, patches.size(-1))      # (N_masked, P)
-        target_masked = patches[mask].view(-1, patches.size(-1)) # (N_masked, P)
+        # Per-patch target normalization
+        #    Removes global intensity variation common in CXRs.
+        #    Focuses the reconstruction objective on local structure (edges,
+        #    vessels, infiltrates) rather than absolute brightness — exactly
+        #    the features relevant for pathology classification.
+        t_mean = targets.mean(dim=-1, keepdim=True)
+        t_std  = targets.std(dim=-1, keepdim=True).clamp(min=1e-6)
+        targets = (targets - t_mean) / t_std
 
-
-        loss = F.l1_loss(pred_masked, target_masked)
+        # L1 loss on masked patches only
+        loss = F.l1_loss(pred[mask], targets[mask])
         return loss
 
 
-# LR schedule (cosine + warmup)
-def cosine_lr_schedule(base_lr, epoch, num_epochs, warmup_epochs):
+# LR schedule
+def get_lr(base_lr: float, epoch: int, num_epochs: int, warmup_epochs: int) -> float:
     if epoch < warmup_epochs:
-        return base_lr * float(epoch + 1) / float(warmup_epochs)
-    t = (epoch - warmup_epochs) / max(1, (num_epochs - warmup_epochs))
+        return base_lr * (epoch + 1) / warmup_epochs
+    t = (epoch - warmup_epochs) / max(1, num_epochs - warmup_epochs)
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * t))
 
 
-# Main training loop
+# Checkpoint helpers
+def save_full_ckpt(path: str, epoch: int, model, optimizer, scaler, best_loss: float):
+    """Full training state — sufficient to resume exactly."""
+    raw = model.module if isinstance(model, DDP) else model
+    torch.save({
+        "epoch":     epoch,
+        "model":     raw.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scaler":    scaler.state_dict(),
+        "best_loss": best_loss,
+    }, path)
+
+
+def save_backbone_ckpt(path: str, model):
+    """
+    Backbone-only checkpoint in the format expected by train.py init_ckpt:
+
+        {"model": {"encoder.<key>": <tensor>, ...}}
+
+    init_ckpt strips the "encoder." prefix and loads directly into
+    model.backbone, so this wrapper is the only required adapter.
+    """
+    raw = model.module if isinstance(model, DDP) else model
+    backbone_sd = raw.backbone.state_dict()
+    torch.save(
+        {"model": {"encoder." + k: v for k, v in backbone_sd.items()}},
+        path,
+    )
+
+
+# Main
 def main():
+    # DDP init
+    ddp = "LOCAL_RANK" in os.environ
+    if ddp:
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        device     = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+        is_main    = (local_rank == 0)
+        world_size = dist.get_world_size()
+    else:
+        device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        is_main    = True
+        local_rank = 0
+        world_size = 1
+
     torch.backends.cudnn.benchmark = True
 
-    ds = UnlabeledCXRDataset(IMAGE_ROOT, img_size=IMG_SIZE)
+    if is_main:
+        print(f"[{datetime.datetime.now()}]  SimMIM CXR pretraining")
+        print(f"  GPUs: {world_size}  |  batch/GPU: {BATCH_SIZE}  |  "
+              f"effective batch: {BATCH_SIZE * world_size * ACCUM_STEPS}")
+
+    # Dataset & loader
+    ds      = CXRPretrainDataset(IMAGE_ROOT, img_size=IMG_SIZE)
+    sampler = DistributedSampler(ds, shuffle=True) if ddp else None
+
     loader = DataLoader(
         ds,
         batch_size=BATCH_SIZE,
-        shuffle=True,
+        sampler=sampler,
+        shuffle=(sampler is None),
         num_workers=NUM_WORKERS,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=True,
+        prefetch_factor=2,
     )
 
+    if is_main:
+        print(f"  Dataset: {len(ds)} images  |  steps/epoch: {len(loader)}")
+
+    # Model
     backbone = SwinTransformerV2(
         img_size=IMG_SIZE,
         patch_size=PATCH_SIZE,
         in_chans=IN_CHANS,
-        embed_dim=96,
-        depths=[2, 2, 18, 2],
-        num_heads=[3, 6, 12, 24],
-        window_size=8,
+        embed_dim=EMBED_DIM,
+        depths=DEPTHS,
+        num_heads=NUM_HEADS,
+        window_size=WINDOW_SIZE,
         mlp_ratio=4.0,
         qkv_bias=True,
         drop_rate=0.0,
@@ -228,7 +425,7 @@ def main():
         drop_path_rate=0.2,
         ape=False,
         patch_norm=True,
-        use_checkpoint=True,  # save VRAM on 3070
+        use_checkpoint=False,
     )
 
     model = SimMIM_SwinV2(
@@ -237,54 +434,113 @@ def main():
         patch_size=PATCH_SIZE,
         in_chans=IN_CHANS,
         mask_ratio=MASK_RATIO,
-    ).to(DEVICE)
+        decoder_dim=DECODER_DIM,
+    ).to(device)
 
+    if ddp:
+        model = DDP(model, device_ids=[local_rank])
+
+    # Optimizer & scaler
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=BASE_LR,
         weight_decay=WEIGHT_DECAY,
         betas=(0.9, 0.95),
     )
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE == "cuda"))
+    # Resume
+    start_epoch = 0
+    best_loss   = float("inf")
 
-    global_step = 0
-    for epoch in range(NUM_EPOCHS):
+    if RESUME_CKPT and os.path.isfile(RESUME_CKPT):
+        ckpt    = torch.load(RESUME_CKPT, map_location="cpu", weights_only=True)
+        raw     = model.module if isinstance(model, DDP) else model
+        raw.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scaler.load_state_dict(ckpt["scaler"])
+        start_epoch = ckpt["epoch"] + 1
+        best_loss   = ckpt.get("best_loss", float("inf"))
+        if is_main:
+            print(f"  Resumed from epoch {ckpt['epoch']}  (best_loss={best_loss:.4f})")
+
+    # Training loop
+    for epoch in range(start_epoch, NUM_EPOCHS):
+        if ddp:
+            sampler.set_epoch(epoch)
+
         model.train()
-        lr = cosine_lr_schedule(BASE_LR, epoch, NUM_EPOCHS, WARMUP_EPOCHS)
+        lr = get_lr(BASE_LR, epoch, NUM_EPOCHS, WARMUP_EPOCHS)
         for g in optimizer.param_groups:
             g["lr"] = lr
 
-        running_loss = 0.0
-        for it, imgs in enumerate(tqdm(loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")):
-            imgs = imgs.to(DEVICE, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        epoch_total_loss = 0.0
+        epoch_steps = 0
+        running_loss   = 0.0
+        accum_count    = 0
 
-            with torch.amp.autocast("cuda", enabled=(DEVICE == "cuda"), dtype=torch.bfloat16):
+        pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}", disable=not is_main)
+        for it, imgs in enumerate(pbar):
+            imgs = imgs.to(device, non_blocking=True)
+
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                    enabled=(device.type == "cuda")):
                 loss = model(imgs) / ACCUM_STEPS
 
             scaler.scale(loss).backward()
+            accum_count += 1
 
-            if (it + 1) % ACCUM_STEPS == 0:
+            if accum_count == ACCUM_STEPS:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                global_step += 1
+                accum_count = 0
 
             running_loss += loss.item() * ACCUM_STEPS
+            epoch_total_loss += loss.item() * ACCUM_STEPS
+            epoch_steps += 1
 
-            if (it + 1) % PRINT_FREQ == 0:
-                avg_loss = running_loss / PRINT_FREQ
-                print(f"[Epoch {epoch+1} Iter {it+1}] lr={lr:.2e} loss={avg_loss:.4f}")
+            if is_main and (it + 1) % PRINT_FREQ == 0:
+                avg = running_loss / PRINT_FREQ
+                pbar.write(
+                    f"  [Ep {epoch + 1:03d}  it {it + 1:5d}] "
+                    f"lr={lr:.2e}  loss={avg:.4f}"
+                )
+                if avg < best_loss:
+                    best_loss = avg
                 running_loss = 0.0
 
-        # Save backbone checkpoint every few epochs
-        if (epoch + 1) % 10 == 0 or (epoch + 1) == NUM_EPOCHS:
-            ckpt_path = f"simmim_swinv2_cxr_backbone_epoch{epoch+1:03d}.pth"
-            torch.save(model.backbone.state_dict(), ckpt_path)
-            print(f"Saved backbone checkpoint to {ckpt_path}")
+        # Flush any leftover accumulated gradients at epoch end
+        if accum_count > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
-    torch.save(model.backbone.state_dict(), OUTPUT_CKPT)
-    print(f"Done. Final backbone saved to {OUTPUT_CKPT}")
+
+        # Periodic saves (rank 0 only)
+        if is_main and (epoch + 1) % SAVE_EVERY == 0:
+            epoch_loss = epoch_total_loss / max(epoch_steps, 1)
+            if epoch_loss < best_loss:
+                best_loss = epoch_loss
+            full_path = f"simmim_full_epoch{epoch + 1:03d}.pth"
+            bk_path   = f"simmim_backbone_epoch{epoch + 1:03d}.pth"
+            save_full_ckpt(full_path, epoch, model, optimizer, scaler, best_loss)
+            save_backbone_ckpt(bk_path, model)
+            print(f"  → saved {full_path}  +  {bk_path}")
+
+    # Final backbone save 
+    if is_main:
+        save_backbone_ckpt(OUTPUT_CKPT, model)
+        print(f"\nDone. Backbone checkpoint → {OUTPUT_CKPT}")
+        print(f"Best observed loss: {best_loss:.4f}")
+
+    if ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
