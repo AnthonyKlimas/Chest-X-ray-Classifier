@@ -104,7 +104,8 @@ CLASSIFIER_DROPOUT = 0.04
 # Wait for backbone to unfreeze
 ETA_RATIO = 0.15
 ATTN_WARMUP_EPOCHS = 6
-ATTN_POOL_UNFREEZE_EPOCH = 4
+ATTN_POOL_UNFREEZE_EPOCH = ATTN_WARMUP_EPOCHS
+
 
 
 # Unfreeze the backbone stages slowly
@@ -468,8 +469,8 @@ class SwinWithView(nn.Module):
             nn.Linear(C, C),
             nn.GELU()
         )
-        nn.init.xavier_uniform_(self.shared[1].weight)
-        nn.init.zeros_(self.shared[1].bias)
+        nn.init.xavier_uniform_(self.shared[0].weight)
+        nn.init.zeros_(self.shared[0].bias)
 
         # Per-class head: each class gets its own (C -> 1) projection
         # implemented efficiently as a single Linear(C, num_classes)
@@ -546,6 +547,8 @@ def init_param_groups(model, base_lr=1e-4, decay=0.8, schedule=None):
     for i, layer in enumerate(model.backbone.layers):
         add(layer.parameters(), base_lr * (decay ** (n_layers - 1 - i)), i)
 
+    add(model.backbone.patch_embed.parameters(), base_lr * (decay ** n_layers), 0)
+    add(model.backbone.norm.parameters(),        base_lr * HEAD_LR_MULTIPLIER, -1)
     add(model.head.parameters(),       base_lr * HEAD_LR_MULTIPLIER, -1)
     add(model.view_embed.parameters(), base_lr, -1)
     add(model.view_mlp.parameters(),   base_lr, -1)
@@ -556,6 +559,7 @@ def init_param_groups(model, base_lr=1e-4, decay=0.8, schedule=None):
 
     leftovers = [p for p in model.parameters() if id(p) not in seen]
     if leftovers:
+        print(f"WARNING: {len(leftovers)} leftover params — check param groups")
         add(leftovers, base_lr * (decay ** len(layers)), -2)
 
     return groups
