@@ -18,15 +18,15 @@ Note one definite inaccuracy: Hernia has such few entries
 that the value test will not yield a valid result. 
 """
 import datetime
-import math
 import os
 import glob
 import time
-import math
-import cv2
+import csv
 import numpy as np
 import pandas as pd
 
+
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 import torch.nn as nn
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -50,6 +50,7 @@ from dataset import (
 )
 
 from swin_transformer_v2 import SwinTransformerV2
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
@@ -67,7 +68,7 @@ SSL_CKPT = "../chest_xray_dataset/swinv2_small_1k_500k.pth"
 
 MODEL_OUTPUT_FILE = "swin_cxr8_best.pth"
 
-
+LOG_PATH = "training_log.csv"
 
 ### Tuning Parameters ###
 # Training Control
@@ -96,6 +97,8 @@ WARMUP_EPOCHS = 3
 WARMUP_START_FACTOR = 0.3
 WARMUP_END_FACTOR = 1.0
 
+EMA_DECAY = 0.9988
+CHECKPOINT_INTERVAL = 5
 
 VIEW_POSITION_SCALE = 0.35
 
@@ -282,39 +285,25 @@ def init_split(df, label_matrix):
 # Loads the SSL checkpoint from the path SSL_CKPT
 def init_ckpt(model, path):
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    ckpt = ckpt["model"]
 
-    # Fix label names
-    ckpt = {
-        k.replace("encoder.", "", 1): v
-        for k, v in ckpt.items()
-        if k.startswith("encoder.") and not k.startswith("encoder.mask_token")
-    }
+    # Already flat — no wrapper key, no encoder prefix to strip
+    # Just drop the recomputed buffers and the classification head
     ckpt = {
         k.replace("rpe_mlp", "cpb_mlp"): v
         for k, v in ckpt.items()
-    }
-
-    # Drop buffers that are recomputed at init from window_size
-    ckpt = {
-        k: v for k, v in ckpt.items()
         if "relative_coords_table" not in k
         and "relative_position_index" not in k
         and "attn_mask" not in k
+        and k not in ("head.weight", "head.bias")  # your head is different
     }
 
     missing, unexpected = model.backbone.load_state_dict(ckpt, strict=False)
 
     unexpected_missing = [k for k in missing if not any(tag in k for tag in EXPECTED_MISSING)]
-    if len(unexpected_missing) > 0:
-        print(f"WARNING: {len(unexpected_missing)} unexpected missing keys (expected only buffers):")
+    if unexpected_missing:
+        print(f"WARNING: {len(unexpected_missing)} unexpected missing keys:")
         for k in unexpected_missing:
             print(f"  {k}")
-
-    # May be source of error if wrong ssl checkpoint file is used
-    # print("Loaded SSL checkpoint. Missing:", missing, "Unexpected:", unexpected)
-    
-    # no need to return ckpt, set in load_state_dict
 
 # Loss
 class AsymmetricLoss(nn.Module):
@@ -577,6 +566,9 @@ if __name__ == "__main__":
 
     # Model Training Checkpoint
     init_ckpt(model=model, path=SSL_CKPT)
+
+    ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(decay=EMA_DECAY))
+
                 
     param_group = init_param_groups(model, base_lr=BASE_LR, decay=LR_LAYER_DECAY)
 
@@ -619,8 +611,10 @@ if __name__ == "__main__":
 
 
     # Training Loop
-    def run_epoch(loader, train=True):
-        model.train() if train else model.eval()
+    def run_epoch(loader, train=True, eval_model=None):
+        active_model = eval_model if (not train and eval_model is not None) else model
+        active_model.train() if train else active_model.eval()
+        # model.train() if train else model.eval()
         total_loss = 0.0
         n_samples = 0
         all_logits, all_labels = [], []
@@ -634,18 +628,15 @@ if __name__ == "__main__":
 
                 with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 # with autocast(device_type="cuda", dtype=torch.float16, enabled=True):
-                    logits = model(imgs, views)
+                    logits = active_model(imgs, views)
                     loss = criterion(logits, lbls)
 
                 if train:
                     loss.backward()
-                    # scaler.scale(loss).backward()
-                    # scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    # scaler.step(optimizer)
-                    # scaler.update()
                     optimizer.step()
                     optimizer.zero_grad()
+                    ema_model.update_parameters(model)
 
                 total_loss += loss.item() * imgs.size(0)
                 all_logits.append(logits.sigmoid().float().cpu().detach())
@@ -679,28 +670,50 @@ if __name__ == "__main__":
         group["base_lr"] = group["lr"]
 
     # Epoch Loop
+    # Initialize CSV log
+    with open(LOG_PATH, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "tr_loss", "tr_auc", "val_loss", "val_auc"] + ALL_CLASSES)
+
     best_val = 0.0
     no_improve = 0
     group_warmup_remaining = {}
-    
 
     for epoch in range(1, NUM_EPOCHS + 1):
-
-        
 
         tr_loss, tr_auc, _ = run_epoch(train_loader, train=True)
         torch.cuda.empty_cache()
         time.sleep(HARDWARE_PITY)
-        val_loss, val_auc, per_class = run_epoch(val_loader, train=False)
+
+        # Evaluate with EMA model
+        val_loss, val_auc, per_class = run_epoch(val_loader, train=False,
+                                                eval_model=ema_model.module)
 
         print("  Per-class AUCs:")
         for cls, auc in sorted(per_class.items(), key=lambda x: x[1]):
             print(f"    {cls:<20s} {auc:.3f}")
 
+        # Write CSV row
+        with open(LOG_PATH, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([epoch, tr_loss, tr_auc, val_loss, val_auc] +
+                            [per_class.get(c, "") for c in ALL_CLASSES])
+
+        # Periodic full checkpoint
+        if epoch % CHECKPOINT_INTERVAL == 0:
+            torch.save({
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "ema_model": ema_model.module.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "best_val": best_val,
+                "no_improve": no_improve,
+            }, f"checkpoint_epoch{epoch:02d}.pth")
+
         if val_auc > best_val:
             best_val = val_auc
             no_improve = 0
-            torch.save(model.state_dict(), MODEL_OUTPUT_FILE)
+            torch.save(ema_model.module.state_dict(), MODEL_OUTPUT_FILE)
             print("  ->  saved")
         else:
             no_improve += 1
@@ -712,7 +725,6 @@ if __name__ == "__main__":
 
         print(f"  head_lr={optimizer.param_groups[0]['lr']:.2e}  "
             f"layer3_lr={next(g['lr'] for g in optimizer.param_groups if g.get('layer_idx')==3):.2e}")
-                
 
         unfreeze_scheduler.step(group_warmup_remaining)
         if epoch <= WARMUP_EPOCHS:
@@ -720,7 +732,6 @@ if __name__ == "__main__":
         else:
             cosine_scheduler.step()
 
-        # Mini-warmup overrides cosine for newly unfrozen groups
         for group in optimizer.param_groups:
             lidx = group.get("layer_idx", -1)
             if lidx in group_warmup_remaining:
@@ -728,13 +739,13 @@ if __name__ == "__main__":
                 scale = UNFREEZE_WARMUP_FACTOR + (1 - UNFREEZE_WARMUP_FACTOR) * (epochs_done / UNFREEZE_WARMUP_EPOCHS)
                 group["lr"] = group["base_lr"] * scale
 
-        # Decrement warmup counters
         for k in list(group_warmup_remaining):
             group_warmup_remaining[k] -= 1
             if group_warmup_remaining[k] <= 0:
                 del group_warmup_remaining[k]
 
-        if no_improve >= PATIENCE:
+        # Guard: don't stop before all unfreeze events have had time to stabilize
+        if no_improve >= PATIENCE and epoch > max(UNFREEZE_SCHEDULE.keys()) + WARMUP_EPOCHS:
             print(f"Early stopping triggered at epoch {epoch}")
             break
 
