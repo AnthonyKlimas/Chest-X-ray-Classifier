@@ -24,6 +24,7 @@ import time
 import csv
 import numpy as np
 import pandas as pd
+import math
 
 
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
@@ -313,6 +314,15 @@ def init_ckpt(model, path):
         for k in unexpected_missing:
             print(f"  {k}")
 
+def init_group_cosine(group, epoch, total_epochs, eta_min, warmup_epochs):
+    # head/view groups: cosine starts after initial warmup
+    # backbone groups: cosine starts from their own unfreeze epoch
+    ue = warmup_epochs if group.get("layer_idx", -1) < 0 else group.get("unfreeze_epoch", 1)
+    effective = max(epoch - ue, 0)
+    T_max = max(total_epochs - ue, 1)
+    cos = 0.5 * (1 + math.cos(math.pi * effective / T_max))
+    return eta_min + (group["base_lr"] - eta_min) * cos
+
 # Loss
 class AsymmetricLoss(nn.Module):
     def __init__(self, gamma_pos=1, gamma_neg=4, clip=0.05,
@@ -412,39 +422,32 @@ class SwinWithView(torch.nn.Module):
 
 
 # Param Groups
-def init_param_groups(model, base_lr=1e-4, decay=0.8):
+def init_param_groups(model, base_lr=1e-4, decay=0.8, schedule=None):
+    schedule = schedule or {}
     groups = []
     seen = set()
 
     def add(params, lr, layer_idx, weight_decay=1e-2):
         wd, no_wd = [], []
-
         for p in params:
             pid = id(p)
-            if pid in seen:
-                continue
+            if pid in seen: continue
             seen.add(pid)
+            (no_wd if p.ndim <= 1 else wd).append(p)
 
-            if p.ndim <= 1:
-                no_wd.append(p)
-            else:
-                wd.append(p)
+        ue = layer_unfreeze_epoch(layer_idx, schedule)
 
-        if wd:
-            groups.append({
-                "params": wd,
-                "lr": lr,
-                "layer_idx": layer_idx,
-                "weight_decay": weight_decay
-            })
-
-        if no_wd:
-            groups.append({
-                "params": no_wd,
-                "lr": lr,
-                "layer_idx": layer_idx,
-                "weight_decay": 0.0
-            })
+        for bucket, wdv in [(wd, weight_decay), (no_wd, 0.0)]:
+            if bucket:
+                groups.append({
+                    "params": bucket,
+                    "lr": lr,
+                    "base_lr": lr,
+                    "layer_idx": layer_idx,
+                    "unfreeze_epoch": ue,
+                    "weight_decay": wdv,
+                })
+    
 
     layers = list(model.backbone.layers)
 
@@ -582,7 +585,10 @@ if __name__ == "__main__":
     ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(decay=EMA_DECAY))
 
                 
-    param_group = init_param_groups(model, base_lr=BASE_LR, decay=LR_LAYER_DECAY)
+    param_group = init_param_groups(model, base_lr=BASE_LR, decay=LR_LAYER_DECAY,
+                                    schedule=UNFREEZE_SCHEDULE)
+
+
 
     optimizer = torch.optim.AdamW(param_group, weight_decay=WEIGHT_DECAY)    
 
@@ -601,12 +607,7 @@ if __name__ == "__main__":
         end_factor=WARMUP_END_FACTOR,
         total_iters=WARMUP_EPOCHS
     )
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=NUM_EPOCHS - WARMUP_EPOCHS,
-        eta_min=ETA_MIN
-    )
-
+   
     # Unfreeze SwinV2 stages to warmup backbone
     unfreeze_scheduler = UnfreezeScheduler(
         layer_to_idx=layer_to_idx,
@@ -614,12 +615,6 @@ if __name__ == "__main__":
         schedule=UNFREEZE_SCHEDULE,
         warmup_epochs=UNFREEZE_WARMUP_EPOCHS
     )
-
-    # scheduler = torch.optim.lr_scheduler.SequentialLR(
-    #     optimizer,
-    #     schedulers=[warmup_scheduler, cosine_scheduler],
-    #     milestones=[WARMUP_EPOCHS]
-    # )
 
 
     # Training Loop
@@ -742,7 +737,10 @@ if __name__ == "__main__":
         if epoch <= WARMUP_EPOCHS:
             warmup_scheduler.step()
         else:
-            cosine_scheduler.step()
+            for group in optimizer.param_groups:
+                group["lr"] = init_group_cosine(
+                    group, epoch, NUM_EPOCHS, ETA_MIN, WARMUP_EPOCHS
+                )
 
 
         for group in optimizer.param_groups:
