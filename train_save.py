@@ -305,7 +305,6 @@ def init_ckpt(model, path):
         and "attn_mask" not in k
         and k not in ("head.weight", "head.bias")  # your head is different
     }
-
     missing, unexpected = model.backbone.load_state_dict(ckpt, strict=False)
 
     unexpected_missing = [k for k in missing if not any(tag in k for tag in EXPECTED_MISSING)]
@@ -568,24 +567,29 @@ if __name__ == "__main__":
 
     model = SwinWithView(backbone=base, num_classes=NUM_CLASSES).to(device)
 
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs")
+        model = torch.nn.DataParallel(model)
+
+    raw_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    
     with torch.no_grad():
         x = torch.randn(1, 3, 256, 256).to(device)
-        feats = model.backbone.forward_features(x)
+        feats = raw_model.backbone.forward_features(x)
         print("Backbone output shape:", feats.shape)
 
 
     layer_to_idx = {
         layer: i
-        for i, layer in enumerate(model.backbone.layers)
+        for i, layer in enumerate(raw_model.backbone.layers)
     }
 
     # Model Training Checkpoint
-    init_ckpt(model=model, path=SSL_CKPT)
+    init_ckpt(model=raw_model, path=SSL_CKPT)
 
-    ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(decay=EMA_DECAY))
-
+    ema_model = AveragedModel(raw_model, multi_avg_fn=get_ema_multi_avg_fn(decay=EMA_DECAY))
                 
-    param_group = init_param_groups(model, base_lr=BASE_LR, decay=LR_LAYER_DECAY,
+    param_group = init_param_groups(raw_model, base_lr=BASE_LR, decay=LR_LAYER_DECAY,
                                     schedule=UNFREEZE_SCHEDULE)
 
 
@@ -643,7 +647,7 @@ if __name__ == "__main__":
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
-                    ema_model.update_parameters(model)
+                    ema_model.update_parameters(raw_model)
 
                 total_loss += loss.item() * imgs.size(0)
                 all_logits.append(logits.sigmoid().float().cpu().detach())
@@ -768,8 +772,7 @@ if __name__ == "__main__":
     print("Done. Best val AUC:", round(best_val, 4))
     
     # Inspect learned view conditioning
-    model.load_state_dict(torch.load(MODEL_OUTPUT_FILE, map_location=device))
-    print("view_scale:", torch.sigmoid(model.view_scale).item() * 2.0)
-    
-    # Print the attn_temp to see if attention pooling sharpened
-    print("attn_temp:", model.attn_temp.item())
+    m = model.module if isinstance(model, torch.nn.DataParallel) else model
+    m.load_state_dict(torch.load(MODEL_OUTPUT_FILE, map_location=device))
+    print("view_scale:", torch.sigmoid(m.view_scale).item() * 2.0)
+    print("attn_temp:", m.attn_temp.item())
