@@ -100,7 +100,7 @@ WARMUP_END_FACTOR = 1.0
 EMA_DECAY = 0.9988
 CHECKPOINT_INTERVAL = 5
 
-VIEW_POSITION_SCALE = 0.35
+VIEW_POSITION_SCALE = 0.2
 
 FEATURE_DROPOUT    = 0.2
 CLASSIFIER_DROPOUT = 0.1
@@ -363,36 +363,40 @@ class SwinWithView(torch.nn.Module):
         )
         self.attn_temp  = torch.nn.Parameter(torch.tensor(1.0))
         self.view_scale = torch.nn.Parameter(torch.tensor(VIEW_POSITION_SCALE))
-        nn.init.zeros_(self.view_mlp[-1].weight)
-        nn.init.zeros_(self.view_mlp[-1].bias)
-        nn.init.zeros_(self.attn_pool[-1].weight)
+        nn.init.normal_(self.attn_pool[-1].weight, std=1e-3)
         nn.init.zeros_(self.attn_pool[-1].bias)
 
-        # Multi-classifier head
-        self.head = torch.nn.Sequential(
-            torch.nn.LayerNorm(C),
-            torch.nn.Dropout(FEATURE_DROPOUT),
-            torch.nn.Linear(C, 768),
-            torch.nn.GELU(),
-            torch.nn.Dropout(CLASSIFIER_DROPOUT),
-            torch.nn.Linear(768, 512),
-            torch.nn.GELU(),
-            torch.nn.Linear(512, num_classes),
-        )
+        nn.init.normal_(self.view_mlp[-1].weight, std=1e-3)
+        nn.init.zeros_(self.view_mlp[-1].bias)
 
+        # Multi-classifier head
+        self.head = nn.Sequential(
+            nn.LayerNorm(C),
+            nn.Dropout(FEATURE_DROPOUT),
+            nn.Linear(C, 256),
+            nn.GELU(),
+            nn.Dropout(CLASSIFIER_DROPOUT),
+            nn.Linear(256, num_classes),
+        )
     def forward(self, x, view_id):
         feats = self.backbone.forward_features(x)  # (B, N, C)
 
         if feats.ndim == 3:
             B, N, C = feats.shape
             attn = self.attn_pool(feats).squeeze(-1)
-            temp = self.attn_temp.clamp(min=0.1)
+            # temp = self.attn_temp.clamp(min=0.1)
+            temp = torch.sigmoid(self.attn_temp) * 4.9 + 0.1
             attn = torch.softmax(attn / temp, dim=1)
             feats = (feats * attn.unsqueeze(-1)).sum(dim=1)
 
-
+        assert feats.ndim == 2, (
+                f"Expected pooled features of shape (B, C), "
+                f"but got shape {feats.shape}. "
+                "Backbone returned unexpected token map."
+        )
         v = self.view_mlp(self.view_embed(view_id))
         gamma, beta = v.chunk(2, dim=-1)
+        gamma = torch.tanh(gamma)
 
         scale = torch.sigmoid(self.view_scale) * 2.0
         feats = feats * (1 + scale * gamma) + beta
@@ -656,7 +660,8 @@ if __name__ == "__main__":
             if n_pos >= MIN_VAL_POSITIVES and n_pos < len(col):
                 auc = roc_auc_score(col, probs[:, c])
                 per_class_auc[ALL_CLASSES[c]] = round(auc, 3)
-                aucs.append(auc)
+                if c != NO_FINDING_COL:
+                    aucs.append(auc)
             elif n_pos > 0:
                 # Still log it, just don't include in mean
                 per_class_auc[ALL_CLASSES[c]] = round(roc_auc_score(col, probs[:, c]), 3)
@@ -723,8 +728,14 @@ if __name__ == "__main__":
             f"train_loss={tr_loss:.4f}  train_auc={tr_auc:.4f}  "
             f"val_loss={val_loss:.4f}  val_auc={val_auc:.4f}")
 
-        print(f"  head_lr={optimizer.param_groups[0]['lr']:.2e}  "
-            f"layer3_lr={next(g['lr'] for g in optimizer.param_groups if g.get('layer_idx')==3):.2e}")
+
+        for group in optimizer.param_groups:
+            lidx = group.get("layer_idx", -1)
+            if lidx in group_warmup_remaining:
+                epochs_done = UNFREEZE_WARMUP_EPOCHS - group_warmup_remaining[lidx]
+                scale = UNFREEZE_WARMUP_FACTOR + (1 - UNFREEZE_WARMUP_FACTOR) * (epochs_done / UNFREEZE_WARMUP_EPOCHS)
+                group["lr"] *= scale
+
 
         unfreeze_scheduler.step(group_warmup_remaining)
         if epoch <= WARMUP_EPOCHS:
@@ -732,17 +743,23 @@ if __name__ == "__main__":
         else:
             cosine_scheduler.step()
 
+
         for group in optimizer.param_groups:
             lidx = group.get("layer_idx", -1)
             if lidx in group_warmup_remaining:
                 epochs_done = UNFREEZE_WARMUP_EPOCHS - group_warmup_remaining[lidx]
                 scale = UNFREEZE_WARMUP_FACTOR + (1 - UNFREEZE_WARMUP_FACTOR) * (epochs_done / UNFREEZE_WARMUP_EPOCHS)
-                group["lr"] = group["base_lr"] * scale
+                group["lr"] *= scale
+
 
         for k in list(group_warmup_remaining):
             group_warmup_remaining[k] -= 1
             if group_warmup_remaining[k] <= 0:
                 del group_warmup_remaining[k]
+
+        head_lr = next(g["lr"] for g in optimizer.param_groups if g.get("layer_idx") == -1)
+        layer0_lr = next(g["lr"] for g in optimizer.param_groups if g.get("layer_idx") == 0)
+        print(f"  head_lr={head_lr:.2e}  layer0_lr={layer0_lr:.2e}")
 
         # Guard: don't stop before all unfreeze events have had time to stabilize
         if no_improve >= PATIENCE and epoch > max(UNFREEZE_SCHEDULE.keys()) + WARMUP_EPOCHS:
