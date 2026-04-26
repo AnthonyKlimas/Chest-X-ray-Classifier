@@ -72,7 +72,7 @@ LOG_PATH = "training_log.csv"
 ### Tuning Parameters ###
 # Training Control
 NUM_EPOCHS = 78
-PATIENCE = 11
+PATIENCE = 9
 
 # Loss Parameters
 GAMMA_POS  = 1.0
@@ -96,7 +96,8 @@ WARMUP_EPOCHS = 3
 WARMUP_START_FACTOR = 0.3
 WARMUP_END_FACTOR = 1.0
 
-ETA_MIN = 3e-5
+ETA_MIN = 2e-5
+
 
 
 EMA_DECAY = 0.9988
@@ -107,14 +108,16 @@ VIEW_POSITION_SCALE = 0.2
 FEATURE_DROPOUT    = 0.2
 CLASSIFIER_DROPOUT = 0.1
 
-# Unfreeze the backbone stages slowly
+NUM_EPOCHS = 35
+PATIENCE = 8
 UNFREEZE_SCHEDULE = {
-     6: 3,
-    11: 2,
-    17: 1,
-    24: 0,
+    2: 3,
+    4: 2,
+    6: 1,
+    8: 0,
 }
-UNFREEZE_WARMUP_EPOCHS = 5
+UNFREEZE_WARMUP_EPOCHS = 3
+
 UNFREEZE_WARMUP_FACTOR = 0.1
 UNFREEZE_BUMP_FACTOR = 1.6
 
