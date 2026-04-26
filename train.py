@@ -118,6 +118,7 @@ UNFREEZE_SCHEDULE = {
 
 UNFREEZE_WARMUP_EPOCHS = 2
 UNFREEZE_WARMUP_FACTOR = 0.1
+UNFREEZE_BUMP_FACTOR    = 1.6
 
 EMA_DECAY = 0.9988
 
@@ -170,6 +171,7 @@ def print_train_parameters():
     print("ATTN_POOL_UNFREEZE_EPOCH", ATTN_POOL_UNFREEZE_EPOCH)
     print("UNFREEZE_WARMUP_EPOCHS", UNFREEZE_WARMUP_EPOCHS)
     print("UNFREEZE_WARMUP_FACTOR",UNFREEZE_WARMUP_FACTOR)
+    print("UNFREEZE_BUMP_FACTOR",   UNFREEZE_BUMP_FACTOR) 
     print("WEIGHT_DECAY", WEIGHT_DECAY)
     print("FEATURE_DROPOUT", FEATURE_DROPOUT)
     print("CLASSIFIER_DROPOUT", CLASSIFIER_DROPOUT)
@@ -298,7 +300,6 @@ def init_ckpt(model, path):
 
 
 
-
 def layer_unfreeze_epoch(layer_idx, schedule):
     if layer_idx < 0:
         return 1
@@ -307,8 +308,11 @@ def layer_unfreeze_epoch(layer_idx, schedule):
             return epoch
     return 1
 
-def make_lr_lambda(unfreeze_epoch, base_lr):
+
+
+def make_lr_lambda(unfreeze_epoch, base_lr, bump=False):
     cosine_span = max(NUM_EPOCHS - unfreeze_epoch - UNFREEZE_WARMUP_EPOCHS, 1)
+    peak = UNFREEZE_BUMP_FACTOR if bump else 1.0          # ← only change inside
 
     def lr_lambda(epoch):
         e = epoch + 1
@@ -316,10 +320,10 @@ def make_lr_lambda(unfreeze_epoch, base_lr):
             return 0.0
         warmup_frac = (e - unfreeze_epoch) / UNFREEZE_WARMUP_EPOCHS
         if warmup_frac < 1.0:
-            return UNFREEZE_WARMUP_FACTOR + (1 - UNFREEZE_WARMUP_FACTOR) * warmup_frac
+            return UNFREEZE_WARMUP_FACTOR + (peak - UNFREEZE_WARMUP_FACTOR) * warmup_frac
         cosine_e = e - unfreeze_epoch - UNFREEZE_WARMUP_EPOCHS
         cos = 0.5 * (1 + math.cos(math.pi * cosine_e / cosine_span))
-        return ETA_RATIO + (1 - ETA_RATIO) * cos
+        return ETA_RATIO + (peak - ETA_RATIO) * cos
 
     return lr_lambda
 
@@ -451,7 +455,7 @@ class SwinWithView(nn.Module):
         self.num_classes = num_classes
         self.use_attention = True 
 
-        # --- Class-specific pooling replaces attn_pool ---
+        # Class-specific pooling replaces attn_pool
         self.attn_pool = ClassSpecificAttnPool(C, num_classes)
 
         # View conditioning (unchanged)
@@ -508,7 +512,7 @@ class SwinWithView(nn.Module):
         B, K, C = pooled.shape
         pooled_flat = pooled.reshape(B * K, C)
 
-        pooled_flat = self.shared(pooled_flat)   # ← INSERT HERE
+        pooled_flat = self.shared(pooled_flat)
 
         logits = self.head(pooled_flat).squeeze(-1)
         logits = logits.reshape(B, K)
@@ -633,7 +637,6 @@ if __name__ == "__main__":
     
     # sampler = init_sampler(label_matrix=label_matrix, train_idx=train_idx)
     sampler = None
-    shuffle = True
     print("Note: Sampler = None")
 
     # Loaders
@@ -645,7 +648,7 @@ if __name__ == "__main__":
         worker_init_fn=worker_init_fn,
         persistent_workers=PERSISTENT_WORKERS,
         pin_memory=True,
-        shuffle=True,
+        shuffle=(sampler is None),
         prefetch_factor=PREFETECH_FACTOR,
     )
 
@@ -702,8 +705,14 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(param_group, weight_decay=WEIGHT_DECAY)
 
 
-    lambdas = [make_lr_lambda(g["unfreeze_epoch"], g["base_lr"])
-            for g in optimizer.param_groups]
+    lambdas = [
+        make_lr_lambda(
+            g["unfreeze_epoch"],
+            g["base_lr"],
+            bump=(g.get("layer_idx", -1) >= 0 and g["unfreeze_epoch"] > 1)
+        )
+        for g in optimizer.param_groups
+    ]
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambdas)
 
@@ -854,7 +863,8 @@ if __name__ == "__main__":
             f"train_loss={tr_loss:.4f}  train_auc={tr_auc:.4f}  "
             f"val_loss={val_loss:.4f}  val_auc={val_auc:.4f}")
 
-        head_lr  = next(g["lr"] for g in optimizer.param_groups if g.get("layer_idx") == -1)
+        head_lr = next(g["lr"] for g in optimizer.param_groups
+                    if g.get("layer_idx") == -1 and g["unfreeze_epoch"] == 1)
         layer3_lr = next(g["lr"] for g in optimizer.param_groups if g.get("layer_idx") == 3)
         print(f"  head_lr={head_lr:.2e}  layer3_lr={layer3_lr:.2e}")
 
@@ -865,6 +875,8 @@ if __name__ == "__main__":
             print(f"Early stopping triggered at epoch {epoch}")
             break
 
+
+    ### End Training Loop ###
     print("Done. Best val AUC:", round(best_val, 4))
     
     # Inspect learned view conditioning
