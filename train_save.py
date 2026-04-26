@@ -30,10 +30,8 @@ from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 import torch.nn as nn
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
-from torchvision import transforms
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MultiLabelBinarizer
-from torch.amp import GradScaler, autocast
+from torch.amp import autocast
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 
@@ -72,15 +70,15 @@ LOG_PATH = "training_log.csv"
 
 ### Tuning Parameters ###
 # Training Control
-NUM_EPOCHS = 48
-PATIENCE = 14
+NUM_EPOCHS = 78
+PATIENCE = 11
 
 # Loss Parameters
 GAMMA_POS  = 1.0
 GAMMA_NEG  = 3.0
 ASYMMETRIC_CLIP = 0.03
 
-# BASE_LR = 5e-5
+
 BASE_LR = 7e-5
 # No pretraining for head
 # Multiply the BASE_LR to compensate
@@ -96,6 +94,9 @@ SAMPLER_POWER = 0.17
 WARMUP_EPOCHS = 3
 WARMUP_START_FACTOR = 0.3
 WARMUP_END_FACTOR = 1.0
+
+ETA_MIN = 3e-5
+
 
 EMA_DECAY = 0.9988
 CHECKPOINT_INTERVAL = 5
@@ -114,6 +115,8 @@ UNFREEZE_SCHEDULE = {
 }
 UNFREEZE_WARMUP_EPOCHS = 5
 UNFREEZE_WARMUP_FACTOR = 0.1
+UNFREEZE_BUMP_FACTOR = 1.6
+
 
 # seconds to sleep after training
 # set to 0 if not concerned about hardware overheating
@@ -157,6 +160,7 @@ def print_train_parameters():
     print("BASE_LR", BASE_LR)
     print("HEAD_LR_MULTIPLIER", HEAD_LR_MULTIPLIER)
     print("LR_LAYER_DECAY", LR_LAYER_DECAY)
+    print("ETA_MIN", ETA_MIN)
     print("PATIENCE", PATIENCE)
     print("VIEW_POSITION_SCALE", VIEW_POSITION_SCALE)
     print("ASYMMETRIC_CLIP", ASYMMETRIC_CLIP)
@@ -164,7 +168,9 @@ def print_train_parameters():
     print("GAMMA_POS", GAMMA_POS)
     print("UNFREEZE_WARMUP_EPOCHS", UNFREEZE_WARMUP_EPOCHS)
     print("UNFREEZE_WARMUP_FACTOR",UNFREEZE_WARMUP_FACTOR)
+    print("UNFREEZE_BUMP_FACTOR",   UNFREEZE_BUMP_FACTOR)
     print("WEIGHT_DECAY", WEIGHT_DECAY)
+    print("EMA_DECAY",           EMA_DECAY)
     print("FEATURE_DROPOUT", FEATURE_DROPOUT)
     print("CLASSIFIER_DROPOUT", CLASSIFIER_DROPOUT)
     print("BATCH_SIZE_VAL", BATCH_SIZE_VAL)
@@ -175,6 +181,8 @@ def print_train_parameters():
     print("VALUE_LOADER_WORKERS", LOADER_WORKERS_VALUE)
     print("PREFETECH_FACTOR", PREFETECH_FACTOR)
     print("PERSISTENT_WORKERS", PERSISTENT_WORKERS)
+    print("CHECKPOINT_INTERVAL", CHECKPOINT_INTERVAL)
+    print("MIN_VAL_POSITIVES",   MIN_VAL_POSITIVES)
     print(datetime.datetime.now())
 
 
@@ -596,7 +604,7 @@ if __name__ == "__main__":
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=NUM_EPOCHS - WARMUP_EPOCHS,
-        eta_min=1e-6
+        eta_min=ETA_MIN
     )
 
     # Unfreeze SwinV2 stages to warmup backbone
@@ -729,13 +737,6 @@ if __name__ == "__main__":
             f"val_loss={val_loss:.4f}  val_auc={val_auc:.4f}")
 
 
-        for group in optimizer.param_groups:
-            lidx = group.get("layer_idx", -1)
-            if lidx in group_warmup_remaining:
-                epochs_done = UNFREEZE_WARMUP_EPOCHS - group_warmup_remaining[lidx]
-                scale = UNFREEZE_WARMUP_FACTOR + (1 - UNFREEZE_WARMUP_FACTOR) * (epochs_done / UNFREEZE_WARMUP_EPOCHS)
-                group["lr"] *= scale
-
 
         unfreeze_scheduler.step(group_warmup_remaining)
         if epoch <= WARMUP_EPOCHS:
@@ -747,8 +748,8 @@ if __name__ == "__main__":
         for group in optimizer.param_groups:
             lidx = group.get("layer_idx", -1)
             if lidx in group_warmup_remaining:
-                epochs_done = UNFREEZE_WARMUP_EPOCHS - group_warmup_remaining[lidx]
-                scale = UNFREEZE_WARMUP_FACTOR + (1 - UNFREEZE_WARMUP_FACTOR) * (epochs_done / UNFREEZE_WARMUP_EPOCHS)
+                epochs_done = UNFREEZE_WARMUP_EPOCHS - group_warmup_remaining[lidx] + 1
+                scale = UNFREEZE_WARMUP_FACTOR + (UNFREEZE_BUMP_FACTOR - UNFREEZE_WARMUP_FACTOR) * (epochs_done / UNFREEZE_WARMUP_EPOCHS)
                 group["lr"] *= scale
 
 
