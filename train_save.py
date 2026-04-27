@@ -370,8 +370,18 @@ class SwinWithView(torch.nn.Module):
 
         # Stage projections: each stage doubles channels (96→192→384→768)
         # Project all to C so they can be stacked and averaged
-        stage_dims = [int(backbone.embed_dim * (2 ** i))
-                      for i in range(len(backbone.layers))]
+        with torch.no_grad():
+            _x = torch.zeros(1, 3, backbone.patch_embed.img_size[0],
+                                    backbone.patch_embed.img_size[1])
+            _x = backbone.patch_embed(_x)
+            if backbone.ape:
+                _x = _x + backbone.absolute_pos_embed
+            _x = backbone.pos_drop(_x)
+            stage_dims = []
+            for layer in backbone.layers:
+                _x = layer(_x)
+                stage_dims.append(_x.shape[-1])  # actual channel dim per stage
+        print("Detected stage dims:", stage_dims)
         self.stage_projs = nn.ModuleList([
             nn.Linear(d, C) if d != C else nn.Identity()
             for d in stage_dims
