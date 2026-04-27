@@ -71,8 +71,8 @@ LOG_PATH = "training_log.csv"
 
 ### Tuning Parameters ###
 # Training Control
-NUM_EPOCHS = 78
-PATIENCE = 9
+NUM_EPOCHS = 35
+PATIENCE = 8
 
 # Loss Parameters
 GAMMA_POS  = 1.0
@@ -108,8 +108,7 @@ VIEW_POSITION_SCALE = 0.2
 FEATURE_DROPOUT    = 0.2
 CLASSIFIER_DROPOUT = 0.1
 
-NUM_EPOCHS = 35
-PATIENCE = 8
+
 UNFREEZE_SCHEDULE = {
     2: 3,
     4: 2,
@@ -368,13 +367,29 @@ class SwinWithView(torch.nn.Module):
         C = backbone.norm.normalized_shape[0]
         backbone.head = nn.Identity()
         self.backbone = backbone
+
+        # Stage projections: each stage doubles channels (96→192→384→768)
+        # Project all to C so they can be stacked and averaged
+        stage_dims = [int(backbone.embed_dim * (2 ** i))
+                      for i in range(len(backbone.layers))]
+        self.stage_projs = nn.ModuleList([
+            nn.Linear(d, C) if d != C else nn.Identity()
+            for d in stage_dims
+        ])
+
+        # Used only on the final stage
         self.attn_pool = torch.nn.Sequential(
             torch.nn.LayerNorm(C),
             torch.nn.Linear(C, 128),
             torch.nn.GELU(),
             torch.nn.Linear(128, 1)
         )
-        
+        # Fuses attn_pool + GAP on final stage → C
+        self.pool_proj = nn.Sequential(
+            nn.Linear(C * 2, C),
+            nn.GELU(),
+        )
+
         self.view_embed = torch.nn.Embedding(2, 32)
         self.view_mlp = torch.nn.Sequential(
             torch.nn.Linear(32, 128),
@@ -383,13 +398,19 @@ class SwinWithView(torch.nn.Module):
         )
         self.attn_temp  = torch.nn.Parameter(torch.tensor(1.0))
         self.view_scale = torch.nn.Parameter(torch.tensor(VIEW_POSITION_SCALE))
+
+        # Init
         nn.init.normal_(self.attn_pool[-1].weight, std=1e-3)
         nn.init.zeros_(self.attn_pool[-1].bias)
-
         nn.init.normal_(self.view_mlp[-1].weight, std=1e-3)
         nn.init.zeros_(self.view_mlp[-1].bias)
+        nn.init.xavier_uniform_(self.pool_proj[0].weight)
+        nn.init.zeros_(self.pool_proj[0].bias)
+        for proj in self.stage_projs:
+            if isinstance(proj, nn.Linear):
+                nn.init.xavier_uniform_(proj.weight)
+                nn.init.zeros_(proj.bias)
 
-        # Multi-classifier head
         self.head = nn.Sequential(
             nn.LayerNorm(C),
             nn.Dropout(FEATURE_DROPOUT),
@@ -398,22 +419,44 @@ class SwinWithView(torch.nn.Module):
             nn.Dropout(CLASSIFIER_DROPOUT),
             nn.Linear(256, num_classes),
         )
-    def forward(self, x, view_id):
-        feats = self.backbone.forward_features(x)  # (B, N, C)
 
-        if feats.ndim == 3:
-            B, N, C = feats.shape
-            attn = self.attn_pool(feats).squeeze(-1)
-            # temp = self.attn_temp.clamp(min=0.1)
-            temp = torch.sigmoid(self.attn_temp) * 4.9 + 0.1
-            attn = torch.softmax(attn / temp, dim=1)
-            feats = (feats * attn.unsqueeze(-1)).sum(dim=1)
+    def forward(self, x, view_id):
+        # Manually replicate forward_features to tap intermediate stages
+        x = self.backbone.patch_embed(x)
+        if self.backbone.ape:
+            x = x + self.backbone.absolute_pos_embed
+        x = self.backbone.pos_drop(x)
+
+        stage_feats = []
+        for i, (layer, proj) in enumerate(zip(self.backbone.layers, self.stage_projs)):
+            x = layer(x)
+            if i < len(self.backbone.layers) - 1:
+                # Early stages: GAP only
+                stage_feats.append(proj(x.mean(dim=1)))
+            else:
+                # Final stage: apply backbone norm, then attn pool + GAP
+                x_normed = self.backbone.norm(x)
+                projected = proj(x_normed)              # Identity, already C
+
+                attn = self.attn_pool(projected).squeeze(-1)
+                temp = torch.sigmoid(self.attn_temp) * 4.9 + 0.1
+                attn = torch.softmax(attn / temp, dim=1)
+                attn_feats = (projected * attn.unsqueeze(-1)).sum(dim=1)  # (B, C)
+
+                gap_feats = projected.mean(dim=1)                          # (B, C)
+
+                stage_feats.append(
+                    self.pool_proj(torch.cat([attn_feats, gap_feats], dim=1))
+                )
+
+        feats = torch.stack(stage_feats, dim=1).mean(dim=1)   # (B, C)
 
         assert feats.ndim == 2, (
-                f"Expected pooled features of shape (B, C), "
-                f"but got shape {feats.shape}. "
-                "Backbone returned unexpected token map."
+            f"Expected pooled features of shape (B, C), "
+            f"but got shape {feats.shape}. "
+            "Backbone returned unexpected token map."
         )
+
         v = self.view_mlp(self.view_embed(view_id))
         gamma, beta = v.chunk(2, dim=-1)
         gamma = torch.tanh(gamma)
@@ -458,10 +501,14 @@ def init_param_groups(model, base_lr=1e-4, decay=0.8, schedule=None):
         layer_idx = len(layers) - 1 - i
         add(layer.parameters(), lr, layer_idx)
 
+    add(model.backbone.patch_embed.parameters(), base_lr * (decay ** len(layers)), layer_idx=-1)
+    add(model.backbone.norm.parameters(), base_lr, layer_idx=-1)
     add(model.head.parameters(), base_lr * HEAD_LR_MULTIPLIER, layer_idx=-1)
+    add(model.stage_projs.parameters(), base_lr * HEAD_LR_MULTIPLIER, layer_idx=-1)
     add(model.view_embed.parameters(), base_lr, -1)
     add(model.view_mlp.parameters(), base_lr, -1)
     add(model.attn_pool.parameters(), base_lr, -1)
+    add(model.pool_proj.parameters(), base_lr, -1)
     add([model.attn_temp, model.view_scale], base_lr, -1)
 
     leftovers = [p for p in model.parameters() if id(p) not in seen]
@@ -578,8 +625,9 @@ if __name__ == "__main__":
     
     with torch.no_grad():
         x = torch.randn(1, 3, 256, 256).to(device)
-        feats = raw_model.backbone.forward_features(x)
-        print("Backbone output shape:", feats.shape)
+        v = torch.zeros(1, dtype=torch.long).to(device)
+        out = raw_model(x, v)
+        print("Model output shape:", out.shape)  # expect (1, NUM_CLASSES)
 
 
     layer_to_idx = {
@@ -678,11 +726,6 @@ if __name__ == "__main__":
 
         return avg_loss, np.mean(aucs) if aucs else 0.0, per_class_auc
 
-
-
-    # After building optimizer, store intended LRs once
-    for group in optimizer.param_groups:
-        group["base_lr"] = group["lr"]
 
     # Epoch Loop
     # Initialize CSV log
