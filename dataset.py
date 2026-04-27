@@ -14,6 +14,8 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 import cv2
 from PIL import Image, ExifTags
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 
 ### Preprocessing Constants
@@ -23,6 +25,7 @@ HORIZONTAL_FLIP_PROB = 0.5
 ROTATION_DEGREES = 2.8
 ROTATION_PROB = 0.5
 
+JITTER_PROB       = 0.5
 JITTER_BRIGHTNESS = 0.08
 JITTER_CONTRAST   = 0.08
 
@@ -58,7 +61,7 @@ class PerImageStandardize(object):
         std = x.std()
         return (x - mean) / (std + 1e-6)
 
-# Unused in train.py; done in another process
+# Unused in current pipeline, but could be used for more aggressive contrast enhancement
 class CLAHETransform:
     def __init__(self, clip_limit, tile_grid_size):
         self.clip_limit = clip_limit
@@ -97,39 +100,31 @@ class CLAHETransform:
         out = out.astype("float32") / 255.0
         return torch.from_numpy(out)
 
+
 ### Transformer Creation ###
-
-# Value Transform
 def make_value_tf(size):
-    return transforms.Compose([
-        transforms.Resize((size, size)),
-        transforms.ToTensor(),
-        # CLAHETransform(clip_limit=CLIP_LIMIT, tile_grid_size=(TILE_GRID_SIZE, TILE_GRID_SIZE)),
-        transforms.Normalize(NIH_CXR8_CUSTOM_MEAN, NIH_CXR8_CUSTOM_STD)
+    return A.Compose([
+        A.Resize(size, size),
+        A.CLAHE(clip_limit=CLIP_LIMIT, tile_grid_size=(TILE_GRID_SIZE, TILE_GRID_SIZE), p=CLAHE_PROB),
+        A.Normalize(mean=NIH_CXR8_CUSTOM_MEAN, std=NIH_CXR8_CUSTOM_STD),
+        ToTensorV2(),
     ])
 
-# Training Transform
+
 def make_train_tf(size):
-    return transforms.Compose([
-        transforms.Resize((size, size)),
-        transforms.RandomHorizontalFlip(p=HORIZONTAL_FLIP_PROB),
-        transforms.RandomApply([
-            transforms.RandomRotation(
-                ROTATION_DEGREES,
-                interpolation=transforms.InterpolationMode.BILINEAR,
-                fill=0,
-                expand=False
-            )
-        ], p=ROTATION_PROB),
-        transforms.ColorJitter(brightness=JITTER_BRIGHTNESS, contrast=JITTER_CONTRAST),
-        transforms.ToTensor(),
-        # transforms.RandomApply(
-        #     [CLAHETransform(clip_limit=CLIP_LIMIT,
-        #                     tile_grid_size=(TILE_GRID_SIZE, TILE_GRID_SIZE))],
-        #     p=CLAHE_PROB,
-        # ),
-        transforms.Normalize(NIH_CXR8_CUSTOM_MEAN, NIH_CXR8_CUSTOM_STD)
+    return A.Compose([
+        A.Resize(size, size),
+        A.HorizontalFlip(p=HORIZONTAL_FLIP_PROB),
+        A.Rotate(limit=ROTATION_DEGREES, p=ROTATION_PROB, interpolation=cv2.INTER_LINEAR),
+        A.CLAHE(clip_limit=CLIP_LIMIT, tile_grid_size=(TILE_GRID_SIZE, TILE_GRID_SIZE), p=CLAHE_PROB),
+        A.ElasticTransform(alpha=1, sigma=10, p=0.3),
+        A.GridDistortion(num_steps=5, distort_limit=0.05, p=0.3),
+        A.ColorJitter(brightness=JITTER_BRIGHTNESS, contrast=JITTER_CONTRAST, p=JITTER_PROB),
+        A.CoarseDropout(max_holes=8, max_height=16, max_width=16, p=0.2),  # occlusion robustness
+        A.Normalize(mean=NIH_CXR8_CUSTOM_MEAN, std=NIH_CXR8_CUSTOM_STD),
+        ToTensorV2(),
     ])
+
 
 ### Dataset ###
 class CXR8Dataset(Dataset):
@@ -145,7 +140,7 @@ class CXR8Dataset(Dataset):
         fname = self.df.loc[i, "Image Index"]
         path = self.lookup[fname]
         img = Image.open(path).convert('RGB')
-        img = self.transform(img)
+        img = self.transform(image=img)["image"]
         lbl = torch.tensor(self.labels[i], dtype=torch.float32)
         view_id = torch.tensor(self.df.loc[i, "view_id"], dtype=torch.long)
         return img, lbl, view_id
@@ -159,13 +154,13 @@ def print_dataset_parameters():
     print("HORIZONTAL_FLIP_PROB", HORIZONTAL_FLIP_PROB)
     print("ROTATION_DEGREES", ROTATION_DEGREES)
     print("ROTATION_PROB", ROTATION_PROB)
+    print("JITTER_PROB", JITTER_PROB)
     print("JITTER_BRIGHTNESS", JITTER_BRIGHTNESS)
     print("JITTER_CONTRAST", JITTER_CONTRAST)
     print("IMAGENET_MEAN", IMAGENET_MEAN)
     print("IMAGENET_STD", IMAGENET_STD)
     print("NIH_CXR8_CUSTOM_MEAN", NIH_CXR8_CUSTOM_MEAN)
     print("NIH_CXR8_CUSTOM_STD", NIH_CXR8_CUSTOM_STD)
-    
 
 # Worker Init; keep for memory safety
 def worker_init_fn(worker_id):
