@@ -120,7 +120,7 @@ def make_train_tf(size):
         A.ElasticTransform(alpha=1, sigma=10, p=0.3),
         A.GridDistortion(num_steps=5, distort_limit=0.05, p=0.3),
         A.ColorJitter(brightness=JITTER_BRIGHTNESS, contrast=JITTER_CONTRAST, p=JITTER_PROB),
-        A.CoarseDropout(max_holes=8, max_height=16, max_width=16, p=0.2),  # occlusion robustness
+        A.CoarseDropout(num_holes_upper=8, hole_height_upper=16, hole_width_upper=16, p=0.2),
         A.Normalize(mean=NIH_CXR8_CUSTOM_MEAN, std=NIH_CXR8_CUSTOM_STD),
         ToTensorV2(),
     ])
@@ -140,6 +140,7 @@ class CXR8Dataset(Dataset):
         fname = self.df.loc[i, "Image Index"]
         path = self.lookup[fname]
         img = Image.open(path).convert('RGB')
+        img = np.array(img)
         img = self.transform(image=img)["image"]
         lbl = torch.tensor(self.labels[i], dtype=torch.float32)
         view_id = torch.tensor(self.df.loc[i, "view_id"], dtype=torch.long)
