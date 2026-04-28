@@ -44,7 +44,7 @@ from dataset import (
     make_value_tf, make_train_tf, worker_init_fn,
     print_dataset_parameters,   
     NIH_CXR8_CUSTOM_MEAN, NIH_CXR8_CUSTOM_STD,
-    CLIP_LIMIT, TILE_GRID_SIZE, CXR8Dataset, CLAHETransform,
+    CLAHE_CLIP_LIMIT, CLAHE_TILE_GRID_SIZE, CXR8Dataset, CLAHETransform,
     PerImageStandardize, ALL_CLASSES
 )
 
@@ -295,34 +295,47 @@ def init_split(df, label_matrix):
 
 # Loads the SSL checkpoint from the path SSL_CKPT
 def init_ckpt(model, path):
-    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    raw = torch.load(path, map_location="cpu", weights_only=True)
 
-    # Already flat — no wrapper key, no encoder prefix to strip
-    # Just drop the recomputed buffers and the classification head
+    # Training checkpoint — load full model directly and return
+    if isinstance(raw, dict) and "model" in raw and "optimizer" in raw:
+        print("Detected training checkpoint, loading full model state")
+        model.load_state_dict(raw["model"])
+        return raw.get("epoch", None), raw.get("best_val", None)
+
+    # SSL/pretrain checkpoint — unwrap and adapt to backbone
+    if isinstance(raw, dict) and "state_dict" in raw:
+        raw = raw["state_dict"]
+
+    sample_keys = list(raw.keys())[:6]
+    print("Checkpoint sample keys:", sample_keys)
+
+    if any(k.startswith("encoder.") for k in raw):
+        print("Stripping 'encoder.' prefix")
+        raw = {k[len("encoder."):]: v
+               for k, v in raw.items()
+               if k.startswith("encoder.")}
+
     ckpt = {
         k.replace("rpe_mlp", "cpb_mlp"): v
-        for k, v in ckpt.items()
+        for k, v in raw.items()
         if "relative_coords_table" not in k
         and "relative_position_index" not in k
         and "attn_mask" not in k
-        and k not in ("head.weight", "head.bias")  # your head is different
+        and k not in ("head.weight", "head.bias")
     }
-    missing, unexpected = model.backbone.load_state_dict(ckpt, strict=False)
 
+    missing, unexpected = model.backbone.load_state_dict(ckpt, strict=False)
     unexpected_missing = [k for k in missing if not any(tag in k for tag in EXPECTED_MISSING)]
     if unexpected_missing:
         print(f"WARNING: {len(unexpected_missing)} unexpected missing keys:")
         for k in unexpected_missing:
             print(f"  {k}")
+    else:
+        print(f"SSL checkpoint loaded OK ({len(missing)} expected missing, {len(unexpected)} unexpected)")
+    
+    return None, None  # no epoch/best_val from SSL checkpoint
 
-def init_group_cosine(group, epoch, total_epochs, eta_min, warmup_epochs):
-    # head/view groups: cosine starts after initial warmup
-    # backbone groups: cosine starts from their own unfreeze epoch
-    ue = warmup_epochs if group.get("layer_idx", -1) < 0 else group.get("unfreeze_epoch", 1)
-    effective = max(epoch - ue, 0)
-    T_max = max(total_epochs - ue, 1)
-    cos = 0.5 * (1 + math.cos(math.pi * effective / T_max))
-    return eta_min + (group["base_lr"] - eta_min) * cos
 
 # Loss
 class AsymmetricLoss(nn.Module):
