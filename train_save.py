@@ -96,7 +96,8 @@ WARMUP_EPOCHS = 3
 WARMUP_START_FACTOR = 0.3
 WARMUP_END_FACTOR = 1.0
 
-ETA_MIN = 2e-5
+# Relative to each group's base_lr, not global eta_min
+ETA_MIN_RATIO = 0.05
 
 
 
@@ -214,13 +215,13 @@ def init_device():
 
     return device
 
-def init_group_cosine(group, epoch, total_epochs, eta_min, warmup_epochs):
-    # head/view groups: cosine starts after initial warmup
-    # backbone groups: cosine starts from their own unfreeze epoch
+
+def init_group_cosine(group, epoch, total_epochs, eta_min_ratio, warmup_epochs):
     ue = warmup_epochs if group.get("layer_idx", -1) < 0 else group.get("unfreeze_epoch", 1)
     effective = max(epoch - ue, 0)
     T_max = max(total_epochs - ue, 1)
     cos = 0.5 * (1 + math.cos(math.pi * effective / T_max))
+    eta_min = group["base_lr"] * eta_min_ratio # per-group floor
     return eta_min + (group["base_lr"] - eta_min) * cos
 
 
@@ -474,14 +475,14 @@ class SwinWithView(torch.nn.Module):
             else:
                 # Final stage: apply backbone norm, then attn pool + GAP
                 x_normed = self.backbone.norm(x)
-                projected = proj(x_normed)              # Identity, already C
+                projected = proj(x_normed) # Identity, already C
 
                 attn = self.attn_pool(projected).squeeze(-1)
                 temp = torch.sigmoid(self.attn_temp) * 4.9 + 0.1
                 attn = torch.softmax(attn / temp, dim=1)
                 attn_feats = (projected * attn.unsqueeze(-1)).sum(dim=1)  # (B, C)
 
-                gap_feats = projected.mean(dim=1)                          # (B, C)
+                gap_feats = projected.mean(dim=1)                         # (B, C)
 
                 stage_feats.append(
                     self.pool_proj(torch.cat([attn_feats, gap_feats], dim=1))
@@ -539,7 +540,7 @@ def init_param_groups(model, base_lr=1e-4, decay=0.8, schedule=None):
         layer_idx = len(layers) - 1 - i
         add(layer.parameters(), lr, layer_idx)
 
-    add(model.backbone.patch_embed.parameters(), base_lr * (decay ** len(layers)), layer_idx=-1)
+    add(model.backbone.patch_embed.parameters(), base_lr * (decay ** (len(layers)-1)), layer_idx=0)
     add(model.backbone.norm.parameters(), base_lr, layer_idx=-1)
     add(model.head.parameters(), base_lr * HEAD_LR_MULTIPLIER, layer_idx=-1)
     add(model.stage_projs.parameters(), base_lr * HEAD_LR_MULTIPLIER, layer_idx=-1)
@@ -556,9 +557,8 @@ def init_param_groups(model, base_lr=1e-4, decay=0.8, schedule=None):
     return groups
 
 
-# Main Model Driver
-if __name__ == "__main__":
-
+### Main Model Driver ###
+def main():
     # For logging & tuning purposes
     print_train_parameters()
     print_dataset_parameters()
@@ -827,7 +827,7 @@ if __name__ == "__main__":
         else:
             for group in optimizer.param_groups:
                 group["lr"] = init_group_cosine(
-                    group, epoch, NUM_EPOCHS, ETA_MIN, WARMUP_EPOCHS
+                    group, epoch, NUM_EPOCHS, ETA_MIN_RATIO, WARMUP_EPOCHS
                 )
 
 
@@ -860,3 +860,7 @@ if __name__ == "__main__":
     m.load_state_dict(torch.load(MODEL_OUTPUT_FILE, map_location=device))
     print("view_scale:", torch.sigmoid(m.view_scale).item() * 2.0)
     print("attn_temp:", m.attn_temp.item())
+
+
+if __name__ == "__main__":
+    main()
