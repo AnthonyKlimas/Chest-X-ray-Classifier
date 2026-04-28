@@ -416,47 +416,37 @@ class SwinWithView(torch.nn.Module):
             for d in stage_dims
         ])
 
-        # Used only on the final stage
-        self.attn_pool = torch.nn.Sequential(
-            torch.nn.LayerNorm(C),
-            torch.nn.Linear(C, 128),
-            torch.nn.GELU(),
-            torch.nn.Linear(128, 1)
-        )
-        # Fuses attn_pool + GAP on final stage → C
-        self.pool_proj = nn.Sequential(
-            nn.Linear(C * 2, C),
-            nn.GELU(),
-        )
 
+        self.class_queries = nn.Parameter(torch.randn(num_classes, C) * 0.02)
+        self.class_norm = nn.LayerNorm(C)
+        self.attn_scale = C ** -0.5
+        
         self.view_embed = torch.nn.Embedding(2, 32)
         self.view_mlp = torch.nn.Sequential(
             torch.nn.Linear(32, 128),
             torch.nn.GELU(),
             torch.nn.Linear(128, C * 2)
         )
-        self.attn_temp  = torch.nn.Parameter(torch.tensor(1.0))
         self.view_scale = torch.nn.Parameter(torch.tensor(VIEW_POSITION_SCALE))
 
         # Init
-        nn.init.normal_(self.attn_pool[-1].weight, std=1e-3)
-        nn.init.zeros_(self.attn_pool[-1].bias)
+
         nn.init.normal_(self.view_mlp[-1].weight, std=1e-3)
         nn.init.zeros_(self.view_mlp[-1].bias)
-        nn.init.xavier_uniform_(self.pool_proj[0].weight)
-        nn.init.zeros_(self.pool_proj[0].bias)
+        nn.init.trunc_normal_(self.class_queries, std=0.02)
+
         for proj in self.stage_projs:
             if isinstance(proj, nn.Linear):
                 nn.init.xavier_uniform_(proj.weight)
                 nn.init.zeros_(proj.bias)
 
-        self.head = nn.Sequential(
+        self.class_head = nn.Sequential(
             nn.LayerNorm(C),
             nn.Dropout(FEATURE_DROPOUT),
             nn.Linear(C, 256),
             nn.GELU(),
             nn.Dropout(CLASSIFIER_DROPOUT),
-            nn.Linear(256, num_classes),
+            nn.Linear(256, 1),   # one logit per class
         )
 
     def forward(self, x, view_id):
@@ -473,36 +463,36 @@ class SwinWithView(torch.nn.Module):
                 # Early stages: GAP only
                 stage_feats.append(proj(x.mean(dim=1)))
             else:
-                # Final stage: apply backbone norm, then attn pool + GAP
-                x_normed = self.backbone.norm(x)
-                projected = proj(x_normed) # Identity, already C
+                x_normed = self.backbone.norm(x)          # (B, N, C)
+                x_normed = self.class_norm(x_normed)
 
-                attn = self.attn_pool(projected).squeeze(-1)
-                temp = torch.sigmoid(self.attn_temp) * 4.9 + 0.1
-                attn = torch.softmax(attn / temp, dim=1)
-                attn_feats = (projected * attn.unsqueeze(-1)).sum(dim=1)  # (B, C)
+                B = x_normed.size(0)
+                Q = self.class_queries.unsqueeze(0).expand(B, -1, -1)   # (B, num_classes, C)
 
-                gap_feats = projected.mean(dim=1)                         # (B, C)
+                # Scaled dot-product cross-attention
+                attn = torch.bmm(Q, x_normed.transpose(1, 2)) * self.attn_scale  # (B, num_classes, N)
+                attn = torch.softmax(attn, dim=-1)
+                class_feats = torch.bmm(attn, x_normed)                 # (B, num_classes, C)
 
-                stage_feats.append(
-                    self.pool_proj(torch.cat([attn_feats, gap_feats], dim=1))
-                )
+                # Residual: broadcast early-stage GAP into each class slot
+                early_mean = torch.stack(stage_feats, dim=1).mean(dim=1)  # (B, C)
+                class_feats = class_feats + early_mean.unsqueeze(1)
 
-        feats = torch.stack(stage_feats, dim=1).mean(dim=1)   # (B, C)
+                stage_feats.append(class_feats)   # keep as (B, num_classes, C)
 
-        assert feats.ndim == 2, (
-            f"Expected pooled features of shape (B, C), "
-            f"but got shape {feats.shape}. "
-            "Backbone returned unexpected token map."
-        )
 
-        v = self.view_mlp(self.view_embed(view_id))
-        gamma, beta = v.chunk(2, dim=-1)
+        # early stages produced (B, C); final produced (B, num_classes, C)
+        class_feats = stage_feats[-1]                              # (B, num_classes, C)
+
+        # Apply view conditioning per class
+        v = self.view_mlp(self.view_embed(view_id))                # (B, C*2)
+        gamma, beta = v.chunk(2, dim=-1)                           # (B, C) each
         gamma = torch.tanh(gamma)
-
         scale = torch.sigmoid(self.view_scale) * 2.0
-        feats = feats * (1 + scale * gamma) + beta
-        return self.head(feats)
+        class_feats = class_feats * (1 + scale * gamma.unsqueeze(1)) + beta.unsqueeze(1)
+
+        logits = self.class_head(class_feats).squeeze(-1)          # (B, num_classes)
+        return logits
 
 
 # Param Groups
@@ -542,13 +532,12 @@ def init_param_groups(model, base_lr=1e-4, decay=0.8, schedule=None):
 
     add(model.backbone.patch_embed.parameters(), base_lr * (decay ** (len(layers)-1)), layer_idx=0)
     add(model.backbone.norm.parameters(), base_lr, layer_idx=-1)
-    add(model.head.parameters(), base_lr * HEAD_LR_MULTIPLIER, layer_idx=-1)
+    add(model.class_head.parameters(), base_lr * HEAD_LR_MULTIPLIER, layer_idx=-1)
     add(model.stage_projs.parameters(), base_lr * HEAD_LR_MULTIPLIER, layer_idx=-1)
     add(model.view_embed.parameters(), base_lr, -1)
     add(model.view_mlp.parameters(), base_lr, -1)
-    add(model.attn_pool.parameters(), base_lr, -1)
-    add(model.pool_proj.parameters(), base_lr, -1)
-    add([model.attn_temp, model.view_scale], base_lr, -1)
+    add(model.class_norm.parameters(), base_lr, layer_idx=-1)
+    add([model.class_queries, model.view_scale], base_lr * HEAD_LR_MULTIPLIER, layer_idx=-1)
 
     leftovers = [p for p in model.parameters() if id(p) not in seen]
     if leftovers:
@@ -900,7 +889,6 @@ def main():
     thresholds = ckpt["thresholds"]
 
     print("view_scale:", torch.sigmoid(m.view_scale).item() * 2.0)
-    print("attn_temp:", m.attn_temp.item())
 
 
 if __name__ == "__main__":
