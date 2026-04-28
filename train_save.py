@@ -34,7 +34,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from sklearn.preprocessing import MultiLabelBinarizer
 from torch.amp import autocast
 from tqdm import tqdm
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import f1_score, roc_auc_score
 
 from sklearn.model_selection import StratifiedShuffleSplit
 
@@ -97,11 +97,11 @@ WARMUP_START_FACTOR = 0.3
 WARMUP_END_FACTOR = 1.0
 
 # Relative to each group's base_lr, not global eta_min
-ETA_MIN_RATIO = 0.05
+ETA_MIN_RATIO = 0.09
 
 
 
-EMA_DECAY = 0.9988
+EMA_DECAY = 0.9995
 CHECKPOINT_INTERVAL = 5
 
 VIEW_POSITION_SCALE = 0.2
@@ -748,7 +748,6 @@ def main():
                 all_labels.append(lbls.detach().cpu())
 
 
-
         avg_loss = total_loss / n_samples
         probs  = torch.cat(all_logits).numpy()
         labels = torch.cat(all_labels).numpy()
@@ -766,9 +765,9 @@ def main():
             elif n_pos > 0:
                 # Still log it, just don't include in mean
                 per_class_auc[ALL_CLASSES[c]] = round(roc_auc_score(col, probs[:, c]), 3)
-
-        return avg_loss, np.mean(aucs) if aucs else 0.0, per_class_auc
-
+        
+        
+        return avg_loss, np.mean(aucs), per_class_auc, probs, labels
 
     # Epoch Loop
     # Initialize CSV log
@@ -779,16 +778,20 @@ def main():
     best_val = 0.0
     no_improve = 0
     group_warmup_remaining = {}
+    best_thresh = np.zeros(NUM_CLASSES)
 
     for epoch in range(1, NUM_EPOCHS + 1):
 
-        tr_loss, tr_auc, _ = run_epoch(train_loader, train=True)
+        tr_loss, tr_auc, _, _, _ = run_epoch(train_loader, train=True)
         torch.cuda.empty_cache()
         time.sleep(HARDWARE_PITY)
 
         # Evaluate with EMA model
-        val_loss, val_auc, per_class = run_epoch(val_loader, train=False,
-                                                eval_model=ema_model.module)
+        val_loss, val_auc, per_class, val_probs, val_labels = run_epoch(
+            val_loader,
+            train=False,
+            eval_model=ema_model.module
+        )
 
         print("  Per-class AUCs:")
         for cls, auc in sorted(per_class.items(), key=lambda x: x[1]):
@@ -814,8 +817,38 @@ def main():
         if val_auc > best_val:
             best_val = val_auc
             no_improve = 0
-            torch.save(ema_model.module.state_dict(), MODEL_OUTPUT_FILE)
-            print("  ->  saved")
+
+            # recompute thresholds
+            new_thresh = np.zeros(NUM_CLASSES)
+
+            for c in range(NUM_CLASSES):
+                # skip rare classes
+                if val_labels[:, c].sum() < MIN_VAL_POSITIVES:
+                    new_thresh[c] = 0.5
+                    continue
+
+                best_f1 = 0
+                best_t = 0.5
+
+                for t in np.linspace(0.01, 0.99, 50):
+                    preds = (val_probs[:, c] > t).astype(int)
+                    f1 = f1_score(val_labels[:, c], preds, zero_division=0)
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        best_t = t
+
+                new_thresh[c] = best_t
+
+            best_thresh = new_thresh.copy()
+            print("Updated thresholds:", np.round(best_thresh, 3))
+
+            # save checkpoint with thresholds
+            torch.save({
+                "model": ema_model.module.state_dict(),
+                "thresholds": best_thresh
+            }, MODEL_OUTPUT_FILE)
+
+            print("  -> saved new best model + thresholds")
         else:
             no_improve += 1
             print(f"  (no improvement {no_improve}/{PATIENCE})")
@@ -862,7 +895,10 @@ def main():
     
     # Inspect learned view conditioning
     m = model.module if isinstance(model, torch.nn.DataParallel) else model
-    m.load_state_dict(torch.load(MODEL_OUTPUT_FILE, map_location=device))
+    ckpt = torch.load(MODEL_OUTPUT_FILE, map_location=device)
+    m.load_state_dict(ckpt["model"])
+    thresholds = ckpt["thresholds"]
+
     print("view_scale:", torch.sigmoid(m.view_scale).item() * 2.0)
     print("attn_temp:", m.attn_temp.item())
 
