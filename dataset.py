@@ -62,6 +62,11 @@ class PerImageStandardize(object):
         mean = x.mean()
         std = x.std()
         return (x - mean) / (std + 1e-6)
+    
+def tta_predict(model, imgs, views):
+    p1 = torch.sigmoid(model(imgs, views))
+    p2 = torch.sigmoid(model(imgs.flip(-1), views))
+    return (p1 + p2) / 2
 
 # Unused in current pipeline, but could be used for more aggressive contrast enhancement
 class CLAHETransform:
