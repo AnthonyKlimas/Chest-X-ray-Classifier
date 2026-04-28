@@ -37,7 +37,7 @@ CLAHE_PROB = 1.0 # making consistant for now to increase stability
 # ElasticTransform
 ELASTIC_ALPHA = 1.0
 ELASTIC_SIGMA = 10.0
-ELASTIC_INTERPOLATION = cv2.BILINEAR
+ELASTIC_INTERPOLATION = cv2.INTER_LINEAR
 ELASTIC_FILL  = 0
 ELASTIC_PROB  = 0.3
 
