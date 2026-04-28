@@ -297,28 +297,34 @@ def init_split(df, label_matrix):
 def init_ckpt(model, path):
     raw = torch.load(path, map_location="cpu", weights_only=True)
 
-    # Training checkpoint — load full model directly and return
-    if isinstance(raw, dict) and "model" in raw and "optimizer" in raw:
-        print("Detected training checkpoint, loading full model state")
-        model.load_state_dict(raw["model"])
+    if not isinstance(raw, dict):
+        raise ValueError(f"Unexpected checkpoint format: {type(raw)}")
+
+    # Unwrap outer dict if present
+    state = raw.get("model", raw)
+
+    sample_keys = list(state.keys())[:6]
+    print("State dict sample keys:", sample_keys)
+
+    # Discriminate: training checkpoints (SwinWithView) have backbone.* keys
+    # SSL/SimMIM checkpoints have bare patch_embed.*, layers.* keys
+    is_training_ckpt = any(k.startswith("backbone.") for k in state.keys())
+
+    if is_training_ckpt:
+        print("Detected training checkpoint, loading full SwinWithView state")
+        model.load_state_dict(state)
         return raw.get("epoch", None), raw.get("best_val", None)
 
-    # SSL/pretrain checkpoint — unwrap and adapt to backbone
-    if isinstance(raw, dict) and "state_dict" in raw:
-        raw = raw["state_dict"]
-
-    sample_keys = list(raw.keys())[:6]
-    print("Checkpoint sample keys:", sample_keys)
-
-    if any(k.startswith("encoder.") for k in raw):
+    # SSL checkpoint — strip encoder prefix if present (some SimMIM releases use it)
+    if any(k.startswith("encoder.") for k in state):
         print("Stripping 'encoder.' prefix")
-        raw = {k[len("encoder."):]: v
-               for k, v in raw.items()
-               if k.startswith("encoder.")}
+        state = {k[len("encoder."):]: v
+                 for k, v in state.items()
+                 if k.startswith("encoder.")}
 
     ckpt = {
         k.replace("rpe_mlp", "cpb_mlp"): v
-        for k, v in raw.items()
+        for k, v in state.items()
         if "relative_coords_table" not in k
         and "relative_position_index" not in k
         and "attn_mask" not in k
@@ -327,15 +333,15 @@ def init_ckpt(model, path):
 
     missing, unexpected = model.backbone.load_state_dict(ckpt, strict=False)
     unexpected_missing = [k for k in missing if not any(tag in k for tag in EXPECTED_MISSING)]
+
     if unexpected_missing:
         print(f"WARNING: {len(unexpected_missing)} unexpected missing keys:")
         for k in unexpected_missing:
             print(f"  {k}")
     else:
-        print(f"SSL checkpoint loaded OK ({len(missing)} expected missing, {len(unexpected)} unexpected)")
-    
-    return None, None  # no epoch/best_val from SSL checkpoint
+        print(f"SSL checkpoint loaded OK — {len(missing)} expected missing, {len(unexpected)} unexpected")
 
+    return None, None
 
 # Loss
 class AsymmetricLoss(nn.Module):
