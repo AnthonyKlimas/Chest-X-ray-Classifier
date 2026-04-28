@@ -29,13 +29,17 @@ JITTER_PROB       = 0.5
 JITTER_BRIGHTNESS = 0.08
 JITTER_CONTRAST   = 0.08
 
-# CLAHE constants are only used in preprocess.py
-# It is handled prior to training
-# To enable, uncomment in make_*_tf
-CLIP_LIMIT = 1.5
-TILE_GRID_SIZE = 4
+# Contrast Limited Adaptive Histogram Equalization
+CLAHE_CLIP_LIMIT = 1.5
+CLAHE_TILE_GRID_SIZE = 4
 CLAHE_PROB = 1.0 # making consistant for now to increase stability
 
+# ElasticTransform
+ELASTIC_ALPHA = 1.0
+ELASTIC_SIGMA = 10.0
+ELASTIC_INTERPOLATION = cv2.BILINEAR
+ELASTIC_FILL  = 0
+ELASTIC_PROB  = 0.3
 
 ### Calculated Constants
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -50,8 +54,6 @@ ALL_CLASSES = [
     "Infiltration","Mass","No Finding","Nodule",
     "Pleural_Thickening","Pneumonia","Pneumothorax",
 ]
-
-
 
 
 # Removes global brightness variation
@@ -105,7 +107,11 @@ class CLAHETransform:
 def make_value_tf(size):
     return A.Compose([
         A.Resize(size, size),
-        A.CLAHE(clip_limit=CLIP_LIMIT, tile_grid_size=(TILE_GRID_SIZE, TILE_GRID_SIZE), p=CLAHE_PROB),
+        A.CLAHE(
+            clip_limit=CLAHE_CLIP_LIMIT,
+            tile_grid_size=(CLAHE_TILE_GRID_SIZE,CLAHE_TILE_GRID_SIZE),
+            p=CLAHE_PROB
+        ),
         A.Normalize(mean=NIH_CXR8_CUSTOM_MEAN, std=NIH_CXR8_CUSTOM_STD),
         ToTensorV2(),
     ])
@@ -116,8 +122,18 @@ def make_train_tf(size):
         A.Resize(size, size),
         A.HorizontalFlip(p=HORIZONTAL_FLIP_PROB),
         A.Rotate(limit=ROTATION_DEGREES, p=ROTATION_PROB, interpolation=cv2.INTER_LINEAR),
-        A.CLAHE(clip_limit=CLIP_LIMIT, tile_grid_size=(TILE_GRID_SIZE, TILE_GRID_SIZE), p=CLAHE_PROB),
-        A.ElasticTransform(alpha=1, sigma=10, p=0.3),
+        A.CLAHE(
+            clip_limit=CLAHE_CLIP_LIMIT,
+            tile_grid_size=(CLAHE_TILE_GRID_SIZE, CLAHE_TILE_GRID_SIZE),
+            p=CLAHE_PROB
+        ),
+        A.ElasticTransform(
+            alpha=ELASTIC_ALPHA,
+            sigma=ELASTIC_SIGMA,
+            interpolation=ELASTIC_INTERPOLATION,
+            fill=ELASTIC_FILL,
+            p=ELASTIC_PROB
+        ),
         A.GridDistortion(num_steps=5, distort_limit=0.05, p=0.3),
         A.ColorJitter(brightness=JITTER_BRIGHTNESS, contrast=JITTER_CONTRAST, p=JITTER_PROB),
         A.CoarseDropout(num_holes_upper=8, hole_height_upper=16, hole_width_upper=16, p=0.2),
@@ -149,8 +165,8 @@ class CXR8Dataset(Dataset):
 
 ### Helper functions ###
 def print_dataset_parameters():
-    print("CLIP_LIMIT", CLIP_LIMIT)
-    print("TILE_GRID_SIZE", TILE_GRID_SIZE)
+    print("CLAHE_CLIP_LIMIT", CLAHE_CLIP_LIMIT)
+    print("CLAHE_TILE_GRID_SIZE", CLAHE_TILE_GRID_SIZE)
     print("CLAHE_PROB", CLAHE_PROB)
     print("HORIZONTAL_FLIP_PROB", HORIZONTAL_FLIP_PROB)
     print("ROTATION_DEGREES", ROTATION_DEGREES)
