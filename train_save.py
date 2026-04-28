@@ -41,7 +41,7 @@ from sklearn.model_selection import StratifiedShuffleSplit
 
 
 from dataset import (
-    make_value_tf, make_train_tf, worker_init_fn,
+    make_value_tf, make_train_tf, tta_predict, worker_init_fn,
     print_dataset_parameters,   
     NIH_CXR8_CUSTOM_MEAN, NIH_CXR8_CUSTOM_STD,
     CLAHE_CLIP_LIMIT, CLAHE_TILE_GRID_SIZE, CXR8Dataset, CLAHETransform,
@@ -164,7 +164,7 @@ def print_train_parameters():
     print("BASE_LR", BASE_LR)
     print("HEAD_LR_MULTIPLIER", HEAD_LR_MULTIPLIER)
     print("LR_LAYER_DECAY", LR_LAYER_DECAY)
-    print("ETA_MIN", ETA_MIN)
+    print("ETA_MIN_RATIO", ETA_MIN_RATIO)
     print("PATIENCE", PATIENCE)
     print("VIEW_POSITION_SCALE", VIEW_POSITION_SCALE)
     print("ASYMMETRIC_CLIP", ASYMMETRIC_CLIP)
@@ -172,9 +172,9 @@ def print_train_parameters():
     print("GAMMA_POS", GAMMA_POS)
     print("UNFREEZE_WARMUP_EPOCHS", UNFREEZE_WARMUP_EPOCHS)
     print("UNFREEZE_WARMUP_FACTOR",UNFREEZE_WARMUP_FACTOR)
-    print("UNFREEZE_BUMP_FACTOR",   UNFREEZE_BUMP_FACTOR)
+    print("UNFREEZE_BUMP_FACTOR", UNFREEZE_BUMP_FACTOR)
     print("WEIGHT_DECAY", WEIGHT_DECAY)
-    print("EMA_DECAY",           EMA_DECAY)
+    print("EMA_DECAY", EMA_DECAY)
     print("FEATURE_DROPOUT", FEATURE_DROPOUT)
     print("CLASSIFIER_DROPOUT", CLASSIFIER_DROPOUT)
     print("BATCH_SIZE_VAL", BATCH_SIZE_VAL)
@@ -727,8 +727,13 @@ def main():
                 n_samples += imgs.size(0)
 
                 with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                # with autocast(device_type="cuda", dtype=torch.float16, enabled=True):
-                    logits = active_model(imgs, views)
+                    if train:
+                        logits = active_model(imgs, views)
+                        probs = torch.sigmoid(logits)
+                    else:
+                        probs = tta_predict(active_model, imgs, views)
+                        logits = torch.logit(probs.clamp(1e-6, 1 - 1e-6))
+
                     loss = criterion(logits, lbls)
 
                 if train:
@@ -739,7 +744,7 @@ def main():
                     ema_model.update_parameters(raw_model)
 
                 total_loss += loss.item() * imgs.size(0)
-                all_logits.append(logits.sigmoid().float().cpu().detach())
+                all_logits.append(probs.float().cpu().detach())
                 all_labels.append(lbls.detach().cpu())
 
 
