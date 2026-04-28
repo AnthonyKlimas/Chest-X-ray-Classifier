@@ -214,6 +214,15 @@ def init_device():
 
     return device
 
+def init_group_cosine(group, epoch, total_epochs, eta_min, warmup_epochs):
+    # head/view groups: cosine starts after initial warmup
+    # backbone groups: cosine starts from their own unfreeze epoch
+    ue = warmup_epochs if group.get("layer_idx", -1) < 0 else group.get("unfreeze_epoch", 1)
+    effective = max(epoch - ue, 0)
+    T_max = max(total_epochs - ue, 1)
+    cos = 0.5 * (1 + math.cos(math.pi * effective / T_max))
+    return eta_min + (group["base_lr"] - eta_min) * cos
+
 
 def layer_unfreeze_epoch(layer_idx, schedule):
     if layer_idx < 0:        # head, view embed, attn_pool — always live
