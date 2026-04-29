@@ -2,13 +2,17 @@
 
 ### Project Goal
 
-The goal of this project is to develop and evaluate a deep learning model for multi-label classification of chest X-ray images using the NIH Chest X-ray dataset.
+This project focuses on building a deep learning model for multi-label classification of chest X-ray images using the NIH dataset.
 
-Our goal is to improve performance, measured by AUC, by exploring the impact of different design choices, including:
+The task is challenging because each image can contain multiple diseases, and the dataset is imbalanced.
 
+To handle this, we chose different approaches, including preprocessing techniques, transformer-based architectures, and advanced training strategies, in order to improve performance and understand what actually works best.
+Key Approaches:
 - Image preprocessing techniques such as CLAHE
 - Transformer-based architectures (Swin Transformer and SwinV2)
 - Training strategies such as asymmetric loss, unfreeze schedules, and self-supervised pretraining (SimMIM) 
+
+Our goal was to improve AUC performance, focusing on our most advanced model,  Model 3, which uses a SimMIM pretrained SwinV2 backbone and to push its performance above 81 percent.
 
 ### Dataset
 The NIH Chest X-ray Dataset contains 112,120 images of various resolutions
