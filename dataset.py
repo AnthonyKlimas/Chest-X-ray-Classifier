@@ -118,7 +118,6 @@ def make_value_tf(size):
             p=CLAHE_PROB
         ),
         ToTensorV2(),
-        PerImageStandardize(),
     ])
 
 
@@ -143,7 +142,6 @@ def make_train_tf(size):
         A.ColorJitter(brightness=JITTER_BRIGHTNESS, contrast=JITTER_CONTRAST, p=JITTER_PROB),
         A.CoarseDropout(num_holes_upper=8, hole_height_upper=16, hole_width_upper=16, p=0.2),
         ToTensorV2(),
-        PerImageStandardize(),
     ])
 
 
@@ -163,6 +161,7 @@ class CXR8Dataset(Dataset):
         img = Image.open(path).convert('RGB')
         img = np.array(img)
         img = self.transform(image=img)["image"]
+        PerImageStandardize()(img)
         lbl = torch.tensor(self.labels[i], dtype=torch.float32)
         view_id = torch.tensor(self.df.loc[i, "view_id"], dtype=torch.long)
         return img, lbl, view_id
