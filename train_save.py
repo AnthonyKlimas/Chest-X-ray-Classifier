@@ -74,6 +74,8 @@ LOG_PATH = "training_log.csv"
 NUM_EPOCHS = 35
 PATIENCE = 8
 
+IMAGE_SIZE = 384
+
 # Loss Parameters
 GAMMA_POS  = 0.0
 GAMMA_NEG = 4.0
@@ -161,6 +163,7 @@ def print_train_parameters():
     print("WARMUP_START_FACTOR", WARMUP_START_FACTOR)
     print("WARMUP_END_FACTOR", WARMUP_END_FACTOR)
     print("NUM_EPOCHS", NUM_EPOCHS)
+    print("IMAGE_SIZE", IMAGE_SIZE)
     print("BASE_LR", BASE_LR)
     print("HEAD_LR_MULTIPLIER", HEAD_LR_MULTIPLIER)
     print("LR_LAYER_DECAY", LR_LAYER_DECAY)
@@ -577,8 +580,8 @@ def main():
     train_idx, value_idx = init_split(df, label_matrix=label_matrix)
 
     # Transforms
-    value_tf   = make_value_tf(256)
-    train_tf = make_train_tf(256)
+    value_tf   = make_value_tf(IMAGE_SIZE)
+    train_tf = make_train_tf(IMAGE_SIZE)
     
     train_ds = CXR8Dataset(df, label_matrix, train_idx, train_tf, path_lookup)
     value_ds   = CXR8Dataset(df, label_matrix, value_idx,   value_tf,   path_lookup)
@@ -624,13 +627,13 @@ def main():
 
     # Model
     base = SwinTransformerV2(
-        img_size=256,
+        img_size=IMAGE_SIZE,
         patch_size=4,
         in_chans=3,
         embed_dim=96,
         depths=[2, 2, 18, 2],
         num_heads=[3, 6, 12, 24],
-        window_size=8,
+        window_size=12,
         mlp_ratio=4.0,
         qkv_bias=True,
         drop_rate=0.0,
@@ -651,7 +654,7 @@ def main():
     raw_model = model.module if isinstance(model, torch.nn.DataParallel) else model
     
     with torch.no_grad():
-        x = torch.randn(1, 3, 256, 256).to(device)
+        x = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE).to(device)
         v = torch.zeros(1, dtype=torch.long).to(device)
         out = raw_model(x, v)
         print("Model output shape:", out.shape)  # expect (1, NUM_CLASSES)
