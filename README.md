@@ -88,6 +88,7 @@ Training setup:
 Result:
 - Original reported AUC: 83.62%
 - Patient-level comparison AUC: 81.3%
+
 [Model 1](old_architecture/swin.ipynb) -> original ~83.62%, patient-level comparison ~81.3%
 
 ### Model 2: Swin Transformer + CLAHE
