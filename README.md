@@ -86,8 +86,9 @@ Training setup:
 - Validation images: 16,818
 
 Result:
-- Reported AUC: 83.62%
-[Model 1](old_architecture/swin.ipynb)  ->  ~83.62%
+- Original reported AUC: 83.62%
+- Patient-level comparison AUC: 81.3%
+[Model 1](old_architecture/swin.ipynb) -> original ~83.62%, patient-level comparison ~81.3%
 
 ### Model 2: Swin Transformer + CLAHE
 
@@ -116,10 +117,9 @@ Training setup:
 - Train/validation split: 85% / 15%
 
 Result:
+- Original reported mean validation AUC: 0.840
+- Patient-level comparison AUC: 82.0%
 - Best validation loss: 0.1708
-- Mean validation AUC: 0.840
-- Best epoch by validation loss: epoch 8
-- Highest reported validation AUC during training: 0.8402
 - Highest per-class AUC: Emphysema = 0.932
 
 Class validation AUC:
@@ -144,7 +144,7 @@ Per-class validation AUC:
 | Emphysema | 0.932 |
 | Mean AUC | 0.840 |
 
-[Model 2](old_architecture/swin_clahe.ipynb) -> 84%
+[Model 2](old_architecture/swin_clahe.ipynb) -> original ~84.0%, patient-level comparison ~82.0%
 
 ### Model 3: SimMIM SwinV2 + MLP Head
 
@@ -189,30 +189,29 @@ Training setup:
 - Epochs: up to 48
 - GPU training (CUDA enabled)
 
-Results:
-- Validation AUC improves from ~0.61 in early epochs to ~0.78–0.79
-- Peak performance is around epochs 28–30
-- After this point, validation performance no longer improves
+Result:
+- Validation AUC: ~0.815 (81.5%)
+- Evaluated using patient-level split
 
-Model 3 Class table for final epoch:
+Model 3 Class table for best epoch:
 | Class | AUC |
 |------|-----:|
-| Hernia | 0.640 |
-| Infiltration | 0.684 |
-| Nodule | 0.709 |
-| Pneumonia | 0.734 |
-| Fibrosis | 0.748 |
-| No Finding | 0.757 |
-| Pleural Thickening | 0.766 |
-| Consolidation | 0.775 |
-| Atelectasis | 0.783 |
-| Mass | 0.792 |
-| Effusion | 0.849 |
-| Cardiomegaly | 0.853 |
-| Emphysema | 0.857 |
-| Pneumothorax | 0.860 |
-| Edema | 0.867 |
-| **Mean AUC** | **~0.788** |
+| Hernia | 0.684 |
+| Infiltration | 0.702 |
+| Nodule | 0.731 |
+| Pneumonia | 0.770 |
+| Fibrosis | 0.766 |
+| No Finding | 0.779 |
+| Pleural Thickening | 0.795 |
+| Consolidation | 0.793 |
+| Atelectasis | 0.807 |
+| Mass | 0.829 |
+| Effusion | 0.867 |
+| Cardiomegaly | 0.868 |
+| Emphysema | 0.904 |
+| Pneumothorax | 0.877 |
+| Edema | 0.882 |
+| **Mean AUC** | **0.8148** |
 
 Per-class behavior:
 - Strong performance on frequent classes (Edema, Pneumothorax, Emphysema)
@@ -220,6 +219,26 @@ Per-class behavior:
 - Class imbalance remains a significant challenge
 
 [Model 3](train_save.py) -> 81.5%
+
+### Model 4: Extended SwinV2 with Improved Preprocessing
+
+Model 4 builds on Model 3, maintaining the same architecture and training framework while introducing some modifications improving data quality and generalization.
+
+Key changes include:
+- Increased input resolution to 256 × 256
+- Use of a SimMIM-pretrained SwinV2 backbone trained on NIH chest X-ray images at 384 × 384 resolution
+- Replacement of standard preprocessing with Albumentations
+- Addition of elastic transformations for stronger data augmentation
+- Additional evaluation using both NIH-trained and ImageNet pretrained weights
+
+Model 4 results:
+
+| Model 4 Version | Validation AUC |
+|---|---:|
+| ImageNet baseline | 74.43% |
+| 30 epochs on NIH | 80.80% |
+| 100 epochs on NIH | 81.9866% |
+| 100 epochs + thresholding | 82.01% |
 
 
 ### Install
