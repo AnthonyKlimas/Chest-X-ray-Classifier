@@ -161,6 +161,7 @@ class CXR8Dataset(Dataset):
         img = Image.open(path).convert('RGB')
         img = np.array(img)
         img = self.transform(image=img)["image"]
+        img = img.float() / 255.0
         PerImageStandardize()(img)
         lbl = torch.tensor(self.labels[i], dtype=torch.float32)
         view_id = torch.tensor(self.df.loc[i, "view_id"], dtype=torch.long)
